@@ -19,7 +19,7 @@ exports.handler = async (event) => {
 
         // Step 1: Call the AES Decryption Lambda function
         const lambdaParams = {
-            FunctionName: "aes-decryption",
+            FunctionName: "sol-chap-decryption",
             Payload: JSON.stringify({ encryptedText: encryptedCategoryId }),
         };
         const lambdaResponse = await lambda.invoke(lambdaParams).promise();
