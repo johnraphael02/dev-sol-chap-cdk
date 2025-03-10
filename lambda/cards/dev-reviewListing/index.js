@@ -3,11 +3,13 @@ const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda(); // For invoking the encryption function
 
 // Use the existing "Listings" table
-const TABLE_NAME = process.env.LISTINGS_TABLE_NAME || "Listings";
+const TABLE_NAME = process.env.TABLE_NAME;
 const QUEUE_URL = process.env.REVIEW_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
+const ENCRYPTION_FUNCTION_NAME = "sol-chap-encryption"; // Encryption Lambda name
 
 exports.handler = async (event) => {
     try {
@@ -39,24 +41,50 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: `Invalid status: ${status}. Allowed values: ${allowedStatuses.join(", ")}` }) };
         }
 
-        console.log("Valid request. Preparing to update in DynamoDB...");
+        console.log("Valid request. Invoking encryption function...");
 
-        // Update item in DynamoDB
+        // Invoke the encryption function to encrypt the fields (including id)
+        const encryptionParams = {
+            FunctionName: ENCRYPTION_FUNCTION_NAME,
+            InvocationType: "RequestResponse",
+            Payload: JSON.stringify({
+                id,
+                status,
+                adminId,
+                notes: notes || ""
+            }),
+        };
+
+        const encryptionResponse = await lambda.invoke(encryptionParams).promise();
+        const encryptionPayload = JSON.parse(encryptionResponse.Payload);
+
+        if (encryptionResponse.FunctionError) {
+            console.error("Encryption function error:", encryptionPayload);
+            return { statusCode: 500, body: JSON.stringify({ message: "Encryption function failed", error: encryptionPayload }) };
+        }
+
+        // The encryption function returns a JSON with "encryptedData"
+        const encryptedResult = JSON.parse(encryptionPayload.body);
+        const encryptedData = encryptedResult.encryptedData;
+        // Expecting encryptedData to have: id, status, adminId, and notes
+
+        const reviewedAt = new Date().toISOString();
+
+        // Update item in DynamoDB using encrypted values (including encrypted id in the partition key)
         const updateParams = {
             TableName: TABLE_NAME,
-            Key: { PK: `LISTING#${id}`, SK: "STATUS" },
+            Key: { PK: `LISTING#${encryptedData.id}`, SK: "STATUS" },
             UpdateExpression: "SET #status = :status, reviewedBy = :adminId, reviewedAt = :reviewedAt, notes = :notes",
             ExpressionAttributeNames: {
                 "#status": "status" // Alias for reserved keyword
             },
             ExpressionAttributeValues: {
-                ":status": status,
-                ":adminId": adminId,
-                ":reviewedAt": new Date().toISOString(),
-                ":notes": notes || ""
+                ":status": encryptedData.status,
+                ":adminId": encryptedData.adminId,
+                ":reviewedAt": reviewedAt,
+                ":notes": encryptedData.notes
             }
         };
-        
 
         try {
             await dynamoDB.update(updateParams).promise();
@@ -75,9 +103,13 @@ exports.handler = async (event) => {
                 console.log("Attempting to send message to SQS...");
                 await sqs.sendMessage({
                     QueueUrl: QUEUE_URL,
-                    MessageBody: JSON.stringify({ id, status, action: "review" }),
+                    MessageBody: JSON.stringify({
+                        id: encryptedData.id,
+                        status: encryptedData.status,
+                        action: "review"
+                    }),
                 }).promise();
-                console.log("SQS Message Sent:", id);
+                console.log("SQS Message Sent:", encryptedData.id);
             } catch (sqsError) {
                 console.error("SQS Message Send Failed:", JSON.stringify(sqsError, null, 2));
             }
@@ -91,19 +123,22 @@ exports.handler = async (event) => {
                     {
                         Source: "listing.service",
                         DetailType: "ReviewEvent",
-                        Detail: JSON.stringify({ id, status }),
+                        Detail: JSON.stringify({
+                            id: encryptedData.id,
+                            status: encryptedData.status
+                        }),
                         EventBusName: EVENT_BUS_NAME,
                     },
                 ],
             }).promise();
-            console.log("EventBridge Triggered:", id);
+            console.log("EventBridge Triggered:", encryptedData.id);
         } catch (eventError) {
             console.error("EventBridge Event Failed:", JSON.stringify(eventError, null, 2));
         }
 
         return {
             statusCode: 200,
-            body: JSON.stringify({ message: "Review recorded", id, status }),
+            body: JSON.stringify({ message: "Review recorded", id: encryptedData.id, status: encryptedData.status }),
         };
     } catch (error) {
         console.error("Unexpected Error:", JSON.stringify(error, null, 2));

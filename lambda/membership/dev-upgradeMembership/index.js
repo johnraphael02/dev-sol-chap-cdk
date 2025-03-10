@@ -1,11 +1,12 @@
-const AWS = require('aws-sdk');
+const AWS = require("aws-sdk");
 
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
-const encryptionFunction = "aes-encryption";
 
+// Use environment variable for encryption function name (default to "aes-encryption")
+const encryptionFunction = process.env.ENCRYPTION_FUNCTION || "sol-chap-encryption";
 const USERS_TABLE = process.env.USERS_TABLE; // DynamoDB Users Table
 const MEMBERSHIP_QUEUE_URL = process.env.MEMBERSHIP_QUEUE_URL; // SQS Queue
 
@@ -29,19 +30,25 @@ exports.handler = async (event) => {
 
         const timestamp = new Date().toISOString();
 
-        // Encrypt fields
+        // Invoke the encryption Lambda to encrypt userId, membershipLevel, and email
         const encryptionResponse = await lambda.invoke({
             FunctionName: encryptionFunction,
+            InvocationType: "RequestResponse",
             Payload: JSON.stringify({
                 data: { userId, membershipLevel, email }
             })
         }).promise();
 
+        console.log("Encryption Lambda response:", encryptionResponse);
+
         const encryptionResult = JSON.parse(encryptionResponse.Payload);
-        const encryptedData = JSON.parse(encryptionResult.body).encryptedData?.data;
+        console.log("Parsed encryption result:", encryptionResult);
+
+        const parsedEncryptionBody = JSON.parse(encryptionResult.body);
+        const encryptedData = parsedEncryptionBody.encryptedData?.data;
 
         if (!encryptedData) {
-            throw new Error("Encryption failed");
+            throw new Error("Encryption failed: missing encrypted data");
         }
 
         // Store Membership Upgrade in DynamoDB
@@ -67,17 +74,17 @@ exports.handler = async (event) => {
             return { statusCode: 500, body: JSON.stringify({ error: "DynamoDB Write Failed" }) };
         }
 
-        // Send Membership Update to SQS Queue
+        // Send Membership Update to SQS Queue (if configured)
         if (MEMBERSHIP_QUEUE_URL) {
             try {
                 console.log("Sending membership update to SQS...");
                 await sqs.sendMessage({
+                    QueueUrl: MEMBERSHIP_QUEUE_URL,
                     MessageBody: JSON.stringify({
                         userId: encryptedData.userId,
                         membershipLevel: encryptedData.membershipLevel,
                         timestamp
-                    }),
-                    QueueUrl: MEMBERSHIP_QUEUE_URL,
+                    })
                 }).promise();
                 console.log("Membership update sent to SQS");
             } catch (sqsError) {
@@ -85,25 +92,23 @@ exports.handler = async (event) => {
                 return { statusCode: 500, body: JSON.stringify({ error: "SQS Send Failed" }) };
             }
         } else {
-            console.warn("SQS Queue URL not configured.");
+            console.warn("MEMBERSHIP_QUEUE_URL not configured");
         }
 
-        // Trigger EventBridge
+        // Publish EventBridge event for the membership upgrade
         try {
             console.log("Triggering EventBridge...");
             await eventBridge.putEvents({
-                Entries: [
-                    {
-                        Source: "aws.membership",
-                        DetailType: "UpgradeMembership",
-                        Detail: JSON.stringify({
-                            userId: encryptedData.userId,
-                            membershipLevel: encryptedData.membershipLevel,
-                            timestamp
-                        }),
-                        EventBusName: "default",
-                    },
-                ],
+                Entries: [{
+                    Source: "aws.membership",
+                    DetailType: "UpgradeMembership",
+                    Detail: JSON.stringify({
+                        userId: encryptedData.userId,
+                        membershipLevel: encryptedData.membershipLevel,
+                        timestamp
+                    }),
+                    EventBusName: "default",
+                }],
             }).promise();
             console.log("Event sent to EventBridge");
         } catch (eventBridgeError) {

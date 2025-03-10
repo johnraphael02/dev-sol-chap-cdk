@@ -29,17 +29,21 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: 'schemaId, sectionId, schemaName, and attributes (array) are required' }) };
         }
 
-        // Encrypt the data
+        // Encrypt the data using the encryption function
         let encryptedData;
         try {
             const encryptionResponse = await lambda.invoke({
-                FunctionName: "aes-encryption",
-                Payload: JSON.stringify({ data: { schemaId, sectionId, schemaName, attributes } })
+                FunctionName: "sol-chap-encryption",
+                Payload: JSON.stringify({ body: JSON.stringify({ schemaId, sectionId, schemaName, attributes }) })
             }).promise();
 
             const encryptionResult = JSON.parse(encryptionResponse.Payload);
+            if (encryptionResult.statusCode !== 200) {
+                throw new Error(`Encryption failed: ${encryptionResult.body}`);
+            }
+
             const parsedBody = JSON.parse(encryptionResult.body);
-            encryptedData = parsedBody.encryptedData?.data;
+            encryptedData = parsedBody.encryptedData;
 
             if (!encryptedData || !encryptedData.schemaId || !encryptedData.sectionId || !encryptedData.schemaName) {
                 throw new Error("Encryption failed: Missing encrypted fields");

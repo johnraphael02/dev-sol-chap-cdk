@@ -4,7 +4,7 @@ const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
 
-const encryptionFunction = "aes-encryption";
+const encryptionFunction = process.env.ENCRYPTION_FUNCTION || "sol-chap-encryption";
 const LISTINGS_TABLE = process.env.LISTINGS_TABLE;
 const VERIFY_QUEUE_URL = process.env.VERIFY_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
@@ -13,12 +13,13 @@ exports.handler = async (event) => {
     try {
         let messages = [];
 
+        // Process messages from either SQS or API Gateway
         if (event.Records && Array.isArray(event.Records)) {
             for (const record of event.Records) {
                 try {
                     messages.push(JSON.parse(record.body));
                 } catch (parseError) {
-                    console.error("Error parsing SQS message body:", record.body);
+                    console.error("Error parsing SQS message body:", record.body, parseError);
                 }
             }
         } else if (event.body) {
@@ -26,7 +27,7 @@ exports.handler = async (event) => {
                 const parsedBody = JSON.parse(event.body);
                 messages.push(parsedBody);
             } catch (parseError) {
-                console.error("Error parsing API Gateway event body:", event.body);
+                console.error("Error parsing API Gateway event body:", event.body, parseError);
                 return { statusCode: 400, body: JSON.stringify({ message: "Invalid JSON format" }) };
             }
         } else {
@@ -34,9 +35,26 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: "Unexpected event format" }) };
         }
 
+        // Process each message
         for (const messageBody of messages) {
-            const { listingId, userId, marketplaceId, categoryId, title, description, images = [], attributes = {}, price, creditType, visibility, tags = [], location, expiration } = messageBody;
+            const {
+                listingId,
+                userId,
+                marketplaceId,
+                categoryId,
+                title,
+                description,
+                images = [],
+                attributes = {},
+                price,
+                creditType,
+                visibility,
+                tags = [],
+                location,
+                expiration
+            } = messageBody;
 
+            // Validate required fields
             if (!listingId || !userId || !marketplaceId || !categoryId || !title || !price || !visibility) {
                 console.error("Invalid message format:", messageBody);
                 continue;
@@ -44,8 +62,10 @@ exports.handler = async (event) => {
 
             let encryptedData;
             try {
+                // Invoke the encryption Lambda to encrypt sensitive fields
                 const encryptionResponse = await lambda.invoke({
                     FunctionName: encryptionFunction,
+                    InvocationType: "RequestResponse",
                     Payload: JSON.stringify({
                         data: { listingId, userId, marketplaceId, categoryId, title, description, images, attributes, price, creditType, visibility, tags, location, expiration }
                     })
@@ -120,14 +140,24 @@ exports.handler = async (event) => {
 
             await sqs.sendMessage({
                 QueueUrl: VERIFY_QUEUE_URL,
-                MessageBody: JSON.stringify({ listingId: encryptedData.listingId, title: encryptedData.title, categoryId: encryptedData.categoryId, price: encryptedData.price }),
+                MessageBody: JSON.stringify({
+                    listingId: encryptedData.listingId,
+                    title: encryptedData.title,
+                    categoryId: encryptedData.categoryId,
+                    price: encryptedData.price
+                }),
             }).promise();
 
             await eventBridge.putEvents({
                 Entries: [{
                     Source: "aws.marketplace",
                     DetailType: "VerifyListing",
-                    Detail: JSON.stringify({ listingId: encryptedData.listingId, title: encryptedData.title, categoryId: encryptedData.categoryId, price: encryptedData.price }),
+                    Detail: JSON.stringify({
+                        listingId: encryptedData.listingId,
+                        title: encryptedData.title,
+                        categoryId: encryptedData.categoryId,
+                        price: encryptedData.price
+                    }),
                     EventBusName: EVENT_BUS_NAME,
                 }],
             }).promise();

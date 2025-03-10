@@ -3,16 +3,12 @@ const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda();
 
 const TABLE_NAME = process.env.TABLE_NAME;
 const QUEUE_URL = process.env.QUEUE_URL;
-const EVENTBRIDGE_RULE = process.env.EVENTBRIDGE_RULE;
-
-// Validate environment variables
-if (!TABLE_NAME || !QUEUE_URL || !EVENTBRIDGE_RULE) {
-    console.error("Missing required environment variables.");
-    throw new Error("Server misconfiguration: missing TABLE_NAME, QUEUE_URL, or EVENTBRIDGE_RULE");
-}
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+const ENCRYPTION_LAMBDA = "sol-chap-encryption"; // Lambda for encryption
 
 exports.handler = async (event) => {
     console.log("Received event:", JSON.stringify(event, null, 2));
@@ -42,26 +38,48 @@ exports.handler = async (event) => {
         }
 
         const { sectionId, displayRules } = body;
+        const timestamp = new Date().toISOString(); // Generate timestamps
+        const createdAt = body.createdAt || timestamp; // Keep existing `createdAt` if present
+        const updatedAt = timestamp;
 
-        // Validate displayRules format
-        if (typeof displayRules !== "object" || displayRules === null) {
-            return {
-                statusCode: 400,
-                body: JSON.stringify({ message: "Invalid displayRules format. Must be an object." }),
-            };
+        if (!TABLE_NAME || !QUEUE_URL || !EVENT_BUS_NAME) {
+            throw new Error("Missing required environment variables.");
+        }
+
+        // Encrypt `sectionId`, `PK`, `SK`, and `displayRules`
+        const [encryptedSectionId, encryptedPK, encryptedSK, encryptedDisplayRules] = await Promise.all([
+            encryptText(sectionId),
+            encryptText(`SECTION#${sectionId}`),
+            encryptText("DISPLAY"),
+            encryptText(JSON.stringify(displayRules))
+        ]);
+
+        if (!encryptedSectionId || !encryptedPK || !encryptedSK || !encryptedDisplayRules) {
+            throw new Error("Encryption failed for one or more required fields.");
         }
 
         // Update the display rules in DynamoDB
         const params = {
             TableName: TABLE_NAME,
-            Key: { PK: `SECTION#${sectionId}`, SK: "DISPLAY" },
-            UpdateExpression: "SET displayRules = :rules",
-            ExpressionAttributeValues: { ":rules": displayRules },
+            Key: { PK: encryptedPK, SK: encryptedSK },
+            UpdateExpression: "SET displayRules = :rules, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt",
+            ExpressionAttributeValues: {
+                ":rules": encryptedDisplayRules,
+                ":createdAt": createdAt, // Not encrypted
+                ":updatedAt": updatedAt  // Not encrypted
+            },
         };
 
         // Prepare SQS message
         const sqsMessage = {
-            MessageBody: JSON.stringify({ sectionId, displayRules }),
+            MessageBody: JSON.stringify({
+                sectionId: encryptedSectionId,
+                PK: encryptedPK,
+                SK: encryptedSK,
+                displayRules: encryptedDisplayRules,
+                createdAt,
+                updatedAt
+            }),
             QueueUrl: QUEUE_URL,
         };
 
@@ -74,8 +92,15 @@ exports.handler = async (event) => {
                     {
                         Source: "display.rules.update",
                         DetailType: "DisplayRulesUpdated",
-                        Detail: JSON.stringify({ sectionId, displayRules }),
-                        EventBusName: EVENTBRIDGE_RULE
+                        Detail: JSON.stringify({
+                            sectionId: encryptedSectionId,
+                            PK: encryptedPK,
+                            SK: encryptedSK,
+                            displayRules: encryptedDisplayRules,
+                            createdAt,
+                            updatedAt
+                        }),
+                        EventBusName: EVENT_BUS_NAME
                     }
                 ]
             }).promise()
@@ -96,3 +121,34 @@ exports.handler = async (event) => {
         };
     }
 };
+
+// Helper function for encryption using Lambda invoke
+async function encryptText(text) {
+    try {
+        const encryptionPayload = {
+            FunctionName: ENCRYPTION_LAMBDA,
+            InvocationType: "RequestResponse",
+            Payload: JSON.stringify({ body: JSON.stringify({ text }) }),
+        };
+
+        const encryptionResponse = await lambda.invoke(encryptionPayload).promise();
+        if (!encryptionResponse.Payload) {
+            throw new Error("Encryption Lambda did not return any payload.");
+        }
+
+        const encryptedData = JSON.parse(encryptionResponse.Payload);
+        if (encryptedData.statusCode >= 400) {
+            throw new Error("Encryption Lambda returned an error status.");
+        }
+
+        const parsedBody = JSON.parse(encryptedData.body);
+        if (!parsedBody.encryptedData) {
+            throw new Error("Encryption Lambda response is missing 'encryptedData'.");
+        }
+
+        return parsedBody.encryptedData.text;
+    } catch (error) {
+        console.error("Encryption error:", error);
+        throw error;
+    }
+}

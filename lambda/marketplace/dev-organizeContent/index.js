@@ -3,13 +3,15 @@ const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda();
 
-const TABLE_NAME = process.env.TABLE_NAME;
+const TABLE_NAME = process.env.TABLE_NAME || "Dev-Sections"; 
 const QUEUE_URL = process.env.QUEUE_URL;
-const EVENTBRIDGE_RULE = process.env.EVENTBRIDGE_RULE;
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+const ENCRYPTION_LAMBDA = "sol-chap-encryption";
 
 // Validate environment variables
-if (!TABLE_NAME || !QUEUE_URL || !EVENTBRIDGE_RULE) {
+if (!TABLE_NAME || !QUEUE_URL || !EVENT_BUS_NAME || !ENCRYPTION_LAMBDA) {
     console.error("Missing required environment variables.");
     throw new Error("Server misconfiguration: missing environment variables");
 }
@@ -35,7 +37,6 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: sectionId, name, description, status, order, metadata" }) };
         }
 
-        // Additional field validation
         if (!["ACTIVE", "INACTIVE"].includes(body.status)) {
             return { statusCode: 400, body: JSON.stringify({ message: "Invalid status. Must be 'ACTIVE' or 'INACTIVE'" }) };
         }
@@ -44,8 +45,8 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: "Invalid order. Must be a number." }) };
         }
 
-        const timestamp = Date.now();
-        const item = {
+        // Encrypt all fields including PK and SK (except timestamps)
+        const encryptedValues = await encryptObject({
             PK: `SECTION#${body.sectionId}`,
             SK: "ORGANIZATION",
             sectionId: body.sectionId,
@@ -54,12 +55,24 @@ exports.handler = async (event) => {
             status: body.status,
             order: body.order,
             parentId: body.parentId || null,
-            metadata: {
-                icon: body.metadata.icon || "default-icon",
-                color: body.metadata.color || "#000000",
-                visibility: body.metadata.visibility || "PUBLIC",
-                permissions: Array.isArray(body.metadata.permissions) ? body.metadata.permissions : [],
-            },
+            metadata: JSON.stringify(body.metadata)
+        });
+
+        if (!encryptedValues) {
+            throw new Error("Encryption failed for one or more fields");
+        }
+
+        const timestamp = new Date().toISOString(); // Corrected timestamp format
+        const item = {
+            PK: encryptedValues.PK,
+            SK: encryptedValues.SK,
+            sectionId: encryptedValues.sectionId,
+            name: encryptedValues.name,
+            description: encryptedValues.description,
+            status: encryptedValues.status,
+            order: encryptedValues.order,
+            parentId: encryptedValues.parentId,
+            metadata: encryptedValues.metadata,
             createdAt: timestamp,
             updatedAt: timestamp,
         };
@@ -68,9 +81,9 @@ exports.handler = async (event) => {
         const sqsMessage = {
             MessageBody: JSON.stringify({ 
                 action: "section_organize", 
-                sectionId: body.sectionId,
-                name: body.name,
-                status: body.status
+                sectionId: encryptedValues.sectionId,
+                name: encryptedValues.name,
+                status: encryptedValues.status
             }),
             QueueUrl: QUEUE_URL,
         };
@@ -85,10 +98,10 @@ exports.handler = async (event) => {
                         Source: "section.organizer",
                         DetailType: "SectionUpdated",
                         Detail: JSON.stringify({
-                            sectionId: body.sectionId,
-                            status: body.status
+                            sectionId: encryptedValues.sectionId,
+                            status: encryptedValues.status
                         }),
-                        EventBusName: EVENTBRIDGE_RULE
+                        EventBusName: EVENT_BUS_NAME
                     }
                 ]
             }).promise()
@@ -97,9 +110,50 @@ exports.handler = async (event) => {
         console.log("Operations completed successfully");
 
         return { statusCode: 200, body: JSON.stringify({ message: "Section organized successfully", item }) };
-
     } catch (error) {
         console.error("Error organizing section:", error);
         return { statusCode: 500, body: JSON.stringify({ message: "Internal Server Error", error: error.message }) };
     }
 };
+
+
+// Helper function to encrypt multiple fields using Lambda
+async function encryptObject(obj) {
+    try {
+        const encryptionPayload = {
+            FunctionName: ENCRYPTION_LAMBDA,
+            InvocationType: "RequestResponse",
+            Payload: JSON.stringify({ body: JSON.stringify(obj) }),
+        };
+
+        const encryptionResponse = await lambda.invoke(encryptionPayload).promise();
+        console.log("🔹 Full Encryption Lambda Response:", encryptionResponse);
+
+        if (!encryptionResponse.Payload) {
+            throw new Error("Encryption Lambda did not return any payload.");
+        }
+
+        let encryptedData;
+        try {
+            encryptedData = JSON.parse(encryptionResponse.Payload);
+        } catch (parseError) {
+            throw new Error("Failed to parse Encryption Lambda response.");
+        }
+
+        console.log("Parsed Encryption Response:", encryptedData);
+
+        if (encryptedData.statusCode >= 400) {
+            throw new Error("Encryption Lambda returned an error status.");
+        }
+
+        const parsedBody = JSON.parse(encryptedData.body);
+        if (!parsedBody.encryptedData) {
+            throw new Error("Encryption Lambda response is missing 'encryptedData'.");
+        }
+
+        return parsedBody.encryptedData;
+    } catch (error) {
+        console.error("Encryption error:", error);
+        throw error;
+    }
+}

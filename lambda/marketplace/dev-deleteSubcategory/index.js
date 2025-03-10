@@ -1,96 +1,131 @@
 const AWS = require("aws-sdk");
+
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
-const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const sqs = new AWS.SQS();
+const lambda = new AWS.Lambda();
 
-const SUBCATEGORIES_TABLE = process.env.SUBCATEGORIES_TABLE;
+const SUBCATEGORIES_TABLE = process.env.SUBCATEGORIES_TABLE || "Dev-Subcategories";
 const QUEUE_URL = process.env.QUEUE_URL;
-const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+const ENCRYPTION_LAMBDA = "sol-chap-encryption"; // Lambda for encryption
 
+/**
+ * Invokes the encryption Lambda function.
+ */
+const encryptText = async (text) => {
+    console.log(`🔑 Encrypting text: ${text}`);
+
+    const params = {
+        FunctionName: ENCRYPTION_LAMBDA,
+        InvocationType: "RequestResponse",
+        Payload: JSON.stringify({ PK: text }), // Ensure consistency with encryption Lambda
+    };
+
+    try {
+        const response = await lambda.invoke(params).promise();
+        console.log("🔒 Raw Encryption Lambda Response:", response);
+
+        const payload = JSON.parse(response.Payload);
+        console.log("🔒 Parsed Encryption Response:", payload);
+
+        if (!payload || !payload.body) {
+            throw new Error("Invalid encryption response");
+        }
+
+        const encryptedData = JSON.parse(payload.body);
+        if (!encryptedData.encryptedData || !encryptedData.encryptedData.PK) {
+            throw new Error("Encryption failed, missing PK field");
+        }
+
+        return encryptedData.encryptedData.PK; // Ensure correct field usage
+    } catch (error) {
+        console.error("❌ Error in encryption function:", error);
+        throw new Error("Encryption Lambda response is invalid");
+    }
+};
+
+/**
+ * Lambda Handler for Deleting a Subcategory
+ */
 exports.handler = async (event) => {
     try {
         const subcategoryId = event.pathParameters?.id;
+
         if (!subcategoryId) {
-            return sendResponse(400, { message: "Subcategory ID is required." });
+            return { statusCode: 400, body: JSON.stringify({ message: "Missing subcategoryId" }) };
         }
 
-        console.log(`Deleting subcategory: ${subcategoryId}`);
+        console.log(`🔑 Subcategory ID to encrypt: ${subcategoryId}`);
 
-        // Query to get the categoryId from the correct PK structure
-        const queryParams = {
+        // 🔐 Step 1: Encrypt SUBCATEGORY#<id>
+        const encryptedSubcategoryPK = await encryptText(`SUBCATEGORY#${subcategoryId}`);
+        console.log(`✅ Encrypted PK: ${encryptedSubcategoryPK}`);
+
+        // 🔎 Step 2: Retrieve subcategory details from DynamoDB
+        const getParams = {
             TableName: SUBCATEGORIES_TABLE,
-            KeyConditionExpression: "PK = :subcategoryId",
-            ExpressionAttributeValues: {
-                ":subcategoryId": `SUBCATEGORY#${subcategoryId}`,
-            },
+            KeyConditionExpression: "PK = :pk",
+            ExpressionAttributeValues: { ":pk": encryptedSubcategoryPK },
         };
 
-        const queryResult = await dynamoDB.query(queryParams).promise();
-        if (!queryResult.Items || queryResult.Items.length === 0) {
-            return sendResponse(404, { message: "Subcategory not found." });
+        console.log("🔍 Querying DynamoDB with params:", JSON.stringify(getParams, null, 2));
+
+        const result = await dynamoDB.query(getParams).promise();
+
+        if (!result.Items || result.Items.length === 0) {
+            console.error("❌ Subcategory not found in DynamoDB.");
+            return { statusCode: 404, body: JSON.stringify({ message: "Subcategory not found" }) };
         }
 
-        const categoryId = queryResult.Items[0].SK.replace("CATEGORY#", "");
+        // 🔎 Step 3: Extract SK
+        const subcategoryItem = result.Items[0];
+        const encryptedSK = subcategoryItem.SK;
 
-        // Delete from DynamoDB using the correct PK and SK structure
+        if (!encryptedSK) {
+            return { statusCode: 500, body: JSON.stringify({ message: "Subcategory SK is missing" }) };
+        }
+
+        console.log(`🔐 Encrypted SK: ${encryptedSK}`);
+
+        // 🔓 Step 4: Delete the subcategory
         const deleteParams = {
             TableName: SUBCATEGORIES_TABLE,
-            Key: {
-                PK: `SUBCATEGORY#${subcategoryId}`,
-                SK: `CATEGORY#${categoryId}`,
-            },
+            Key: { PK: encryptedSubcategoryPK, SK: encryptedSK },
         };
 
+        console.log("🗑️ Deleting subcategory from DynamoDB...");
         await dynamoDB.delete(deleteParams).promise();
-        console.log(`Deleted subcategory ${subcategoryId} under category ${categoryId}.`);
+        console.log(`✅ Successfully deleted subcategory: ${subcategoryId}`);
 
-        // Send message to SQS
-        const sqsParams = {
-            QueueUrl: QUEUE_URL,
-            MessageBody: JSON.stringify({
-                action: "DELETE_SUBCATEGORY",
-                subcategoryId,
-                categoryId,
-                timestamp: new Date().toISOString(),
-            }),
-        };
-
-        await sqs.sendMessage(sqsParams).promise();
-        console.log(`Sent SQS message for deleted subcategory ${subcategoryId}.`);
-
-        // Publish event to EventBridge
+        // 📢 Step 5: Publish an event to EventBridge
         const eventParams = {
             Entries: [
                 {
-                    Source: "marketplace.subcategory",
-                    EventBusName: EVENT_BUS_NAME,
+                    Source: "aws.marketplace",
                     DetailType: "SubcategoryDeleted",
-                    Detail: JSON.stringify({
-                        subcategoryId,
-                        categoryId,
-                        timestamp: new Date().toISOString(),
-                    }),
+                    Detail: JSON.stringify({ subcategoryId }),
+                    EventBusName: "default",
                 },
             ],
         };
 
-        await eventBridge.putEvents(eventParams).promise();
-        console.log(`Published EventBridge event for deleted subcategory ${subcategoryId}.`);
+        // 📩 Step 6: Send a message to the SQS queue
+        const sqsParams = {
+            QueueUrl: QUEUE_URL,
+            MessageBody: JSON.stringify({ subcategoryId, action: "deleteSubcategory" }),
+        };
 
-        return sendResponse(200, {
-            message: "Subcategory deleted successfully",
-            subcategoryId,
-            categoryId,
-        });
+        // Execute EventBridge & SQS calls in parallel for efficiency
+        await Promise.all([
+            eventBridge.putEvents(eventParams).promise(),
+            sqs.sendMessage(sqsParams).promise(),
+        ]);
 
+        console.log(`📢 EventBridge event published & 📩 SQS message sent for deleted subcategory: ${subcategoryId}`);
+
+        return { statusCode: 200, body: JSON.stringify({ message: "Subcategory deleted successfully" }) };
     } catch (error) {
-        console.error("Error deleting subcategory:", error);
-        return sendResponse(500, { message: "Internal Server Error", error: error.message });
+        console.error("❌ Error deleting subcategory:", error);
+        return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
     }
 };
-
-// Helper function to send API responses
-const sendResponse = (statusCode, body) => ({
-    statusCode,
-    body: JSON.stringify(body),
-});

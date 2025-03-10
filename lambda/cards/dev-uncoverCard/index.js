@@ -1,123 +1,149 @@
 const AWS = require("aws-sdk");
-
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda();
 
-// Environment Variables
-const CARDS_TABLE = process.env.CARDS_TABLE; // DynamoDB Table
-const QUEUE_URL = process.env.UNCOVER_QUEUE_URL; // SQS Queue for UncoverQueue
-const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME; // EventBridge Bus Name
+const TABLE_NAME = process.env.TABLE_NAME || "Dev-Cards";
+const QUEUE_URL = process.env.UNCOVER_QUEUE_URL;
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+const ENCRYPTION_LAMBDA = "sol-chap-encryption";
 
 exports.handler = async (event) => {
     try {
-        console.log("Incoming Event:", JSON.stringify(event, null, 2));
+        console.log("Received event:", JSON.stringify(event, null, 2));
 
-        //  Extract `id` from pathParameters
-        const pathParams = event.pathParameters || {};
-        console.log("Extracted Path Parameters:", JSON.stringify(pathParams, null, 2));
-
-        const cardId = pathParams.id;
-
-        if (!cardId) {
-            console.error("Validation Failed: Missing `id` in path parameters.");
-            return sendResponse(400, { message: "Missing required field: id (path parameter)." });
+        const id = event.pathParameters && event.pathParameters.id;
+        if (!id) {
+            return { statusCode: 400, body: JSON.stringify({ message: "Missing required field: id in path parameters" }) };
         }
-        
-        //  Extract body and parse JSON safely
+
+        if (!event.body) {
+            return { statusCode: 400, body: JSON.stringify({ message: "Request body is required" }) };
+        }
+
         let body;
         try {
-            body = event.body ? JSON.parse(event.body) : {};
-        } catch (parseError) {
-            console.error("Error parsing request body:", parseError);
-            return sendResponse(400, { message: "Invalid JSON format in request body." });
+            body = JSON.parse(event.body);
+        } catch (error) {
+            console.error("JSON Parse Error:", error);
+            return { statusCode: 400, body: JSON.stringify({ message: "Invalid JSON format" }) };
         }
 
         const { userId, paymentType } = body;
-
-        // Validate inputs
         if (!userId || !paymentType) {
-            console.error("Validation Failed: Missing required fields", { userId, paymentType });
-            return sendResponse(400, { message: "Missing required fields: userId, paymentType." });
+            return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: userId, paymentType." }) };
         }
 
         if (!["CHAPTER_COINS", "GOLD_COINS"].includes(paymentType)) {
-            return sendResponse(400, { message: "Invalid paymentType. Allowed values: CHAPTER_COINS, GOLD_COINS." });
+            return { statusCode: 400, body: JSON.stringify({ message: "Invalid paymentType. Allowed values: CHAPTER_COINS, GOLD_COINS." }) };
+        }
+
+        console.log("Encrypting provided ID before lookup...");
+
+        let encryptedId, encryptedSK, encryptedUserId, encryptedPaymentType;
+        try {
+            // Encrypt id and SK
+            const encryptionResponse = await lambda.invoke({
+                FunctionName: ENCRYPTION_LAMBDA,
+                Payload: JSON.stringify({
+                    body: JSON.stringify({ id, SK: "METADATA" })
+                })
+            }).promise();
+
+            const encryptionResult = JSON.parse(encryptionResponse.Payload);
+            if (encryptionResult.statusCode !== 200) {
+                throw new Error(`Encryption failed: ${encryptionResult.body}`);
+            }
+
+            const parsedBody = JSON.parse(encryptionResult.body);
+            encryptedId = parsedBody.encryptedData.id;
+            encryptedSK = parsedBody.encryptedData.SK;
+
+            if (!encryptedId || !encryptedSK) {
+                throw new Error("Encryption failed: Missing encrypted ID or SK");
+            }
+
+            // Encrypt userId and paymentType
+            console.log("Encrypting userId and paymentType...");
+            const encryptionPayload = JSON.stringify({ userId, paymentType });
+            const encryptionResponse2 = await lambda.invoke({
+                FunctionName: ENCRYPTION_LAMBDA,
+                Payload: JSON.stringify({ body: encryptionPayload })
+            }).promise();
+
+            const encryptionResult2 = JSON.parse(encryptionResponse2.Payload);
+            if (encryptionResult2.statusCode !== 200) {
+                throw new Error(`Encryption failed: ${encryptionResult2.body}`);
+            }
+
+            const parsedBody2 = JSON.parse(encryptionResult2.body);
+            encryptedUserId = parsedBody2.encryptedData.userId;
+            encryptedPaymentType = parsedBody2.encryptedData.paymentType;
+
+            if (!encryptedUserId || !encryptedPaymentType) {
+                throw new Error("Encryption failed: Missing encrypted userId or paymentType");
+            }
+
+        } catch (encryptionError) {
+            console.error("Encryption error:", encryptionError);
+            return { statusCode: 500, body: JSON.stringify({ message: "Encryption failed" }) };
+        }
+
+        console.log("Fetching encrypted ID from DynamoDB...");
+
+        let existingItem;
+        try {
+            const result = await dynamoDB.get({
+                TableName: TABLE_NAME,
+                Key: { PK: `CARD#${encryptedId}`, SK: encryptedSK }
+            }).promise();
+            existingItem = result.Item;
+
+            if (!existingItem) {
+                return { statusCode: 404, body: JSON.stringify({ message: "Card not found" }) };
+            }
+        } catch (dbError) {
+            console.error("DynamoDB Fetch Error:", dbError);
+            return { statusCode: 500, body: JSON.stringify({ message: "Failed to retrieve existing data", error: dbError.message }) };
         }
 
         const timestamp = new Date().toISOString();
+        const updateExpression = ["#updatedAt = :updatedAt"];
+        const expressionAttributeNames = { "#updatedAt": "updatedAt" };
+        const expressionAttributeValues = { ":updatedAt": timestamp };
 
-        //  Check if the card is already uncovered
-        const getParams = {
-            TableName: CARDS_TABLE,
-            Key: {
-                "CARD#{id}": `CARD#${cardId}`,
-                "METADATA": "DETAILS",
-            },
-        };
+        updateExpression.push("#paymentType = :paymentType", "#userId = :userId");
+        expressionAttributeNames["#paymentType"] = "paymentType";
+        expressionAttributeNames["#userId"] = "userId";
+        expressionAttributeValues[":paymentType"] = encryptedPaymentType;
+        expressionAttributeValues[":userId"] = encryptedUserId;
 
-        try {
-            const existingItem = await dynamoDB.get(getParams).promise();
-            if (existingItem.Item) {
-                return sendResponse(400, { message: "Card is already uncovered." });
-            }
-        } catch (getError) {
-            console.error("DynamoDB Get Error:", getError);
-            return sendResponse(500, { message: "DynamoDB get error", error: getError.message });
-        }
+        console.log("DynamoDB Update Parameters:", JSON.stringify(updateExpression, null, 2));
 
-        // Insert the new uncovered card record
-        const putParams = {
-            TableName: CARDS_TABLE,
-            Item: {
-                "CARD#{id}": `CARD#${cardId}`,  // Matches DynamoDB schema
-                "METADATA": "DETAILS",  // Correct SK name
-                "userId": userId,
-                "paymentType": paymentType,
-                "uncoveredAt": timestamp
-            },
-            ConditionExpression: "attribute_not_exists(#PK) AND attribute_not_exists(#SK)", //  Ensures uniqueness
-            ExpressionAttributeNames: {
-                "#PK": "CARD#{id}",  //  Map PK placeholder
-                "#SK": "METADATA"    //  Map SK placeholder
-            }
-        };
+        await dynamoDB.update({
+            TableName: TABLE_NAME,
+            Key: { PK: `CARD#${encryptedId}`, SK: encryptedSK },
+            UpdateExpression: `SET ${updateExpression.join(", ")}`,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ExpressionAttributeValues: expressionAttributeValues,
+            ReturnValues: "UPDATED_NEW",
+        }).promise();
 
-        console.log("DynamoDB Put Params:", JSON.stringify(putParams, null, 2));
+        console.log("DynamoDB Updated Successfully");
 
-        try {
-            await dynamoDB.put(putParams).promise();
-        } catch (dbError) {
-            if (dbError.code === "ConditionalCheckFailedException") {
-                console.error("Card already uncovered:", dbError);
-                return sendResponse(400, { message: "Card is already uncovered." });
-            }
-            console.error("DynamoDB Error:", dbError);
-            return sendResponse(500, { message: "DynamoDB error", error: dbError.message });
-        }
-
-        // Send to SQS (UncoverQueue)
-        const sqsParams = {
+        const sqsMessage = {
             QueueUrl: QUEUE_URL,
             MessageBody: JSON.stringify({
                 action: "CARD_UNCOVERED",
-                cardId,
-                userId,
-                paymentType,
+                cardId: encryptedId,
+                userId: encryptedUserId,
+                paymentType: encryptedPaymentType,
                 uncoveredAt: timestamp,
             }),
         };
+        await sqs.sendMessage(sqsMessage).promise();
 
-        console.log("SQS Send Params:", JSON.stringify(sqsParams, null, 2));
-
-        try {
-            await sqs.sendMessage(sqsParams).promise();
-        } catch (sqsError) {
-            console.error("SQS Error:", sqsError);
-            return sendResponse(500, { message: "SQS error", error: sqsError.message });
-        }
-
-        //  Publish event to EventBridge (UncoverEvent)
         const eventBridgeParams = {
             Entries: [
                 {
@@ -125,40 +151,28 @@ exports.handler = async (event) => {
                     EventBusName: EVENT_BUS_NAME,
                     DetailType: "CardUncovered",
                     Detail: JSON.stringify({
-                        cardId,
-                        userId,
-                        paymentType,
+                        cardId: encryptedId,
+                        userId: encryptedUserId,
+                        paymentType: encryptedPaymentType,
                         uncoveredAt: timestamp,
                     }),
                 },
             ],
         };
+        await eventBridge.putEvents(eventBridgeParams).promise();
 
-        console.log("EventBridge Publish Params:", JSON.stringify(eventBridgeParams, null, 2));
-
-        try {
-            await eventBridge.putEvents(eventBridgeParams).promise();
-        } catch (eventError) {
-            console.error("EventBridge Error:", eventError);
-            return sendResponse(500, { message: "EventBridge error", error: eventError.message });
-        }
-
-        return sendResponse(200, {
+        return { statusCode: 200, body: JSON.stringify({
             message: "Card uncovered successfully",
-            cardId,
-            userId,
-            paymentType,
+            cardId: encryptedId,
+            userId: encryptedUserId,
+            paymentType: encryptedPaymentType,
             uncoveredAt: timestamp,
-        });
-
+        })};
     } catch (error) {
-        console.error("General Lambda Error:", error);
-        return sendResponse(500, { message: "Internal Server Error", error: error.message });
+        console.error("Unexpected Error:", JSON.stringify(error, null, 2));
+        return {
+            statusCode: 500,
+            body: JSON.stringify({ error: error.message }),
+        };
     }
 };
-
-// Helper function for sending responses
-const sendResponse = (statusCode, body) => ({
-    statusCode,
-    body: JSON.stringify(body),
-});

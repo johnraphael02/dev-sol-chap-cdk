@@ -1,11 +1,11 @@
-const AWS = require("aws-sdk");
+const AWS = require('aws-sdk');
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
+const lambda = new AWS.Lambda();
 
-const TABLE_NAME = process.env.CARDS_TABLE_NAME || "Cards";
+const TABLE_NAME = process.env.TABLE_NAME || "Dev-Cards";
 const QUEUE_URL = process.env.QUEUE_URL;
-const COGNITO_POOL = process.env.COGNITO_POOL;
-const EVENTBRIDGE_RULE = process.env.EVENTBRIDGE_RULE;
+const ENCRYPTION_LAMBDA = "sol-chap-encryption";
 
 exports.handler = async (event) => {
     try {
@@ -17,54 +17,68 @@ exports.handler = async (event) => {
 
         let body;
         try {
-            body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
+            body = JSON.parse(event.body);
         } catch (error) {
             console.error("JSON Parse Error:", error);
             return { statusCode: 400, body: JSON.stringify({ message: "Invalid JSON format" }) };
         }
 
-        // Extract required fields
         const { id, title, description, userId, paymentType, status } = body;
 
-        if (!id || typeof id !== "string" || id.trim() === "") {
-            return { statusCode: 400, body: JSON.stringify({ message: "Missing or invalid required field: id" }) };
+        if (!id || !title || !description || !userId || !status) {
+            return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: id, title, description, userId, status" }) };
         }
 
-        if (!title || !description || !userId || !status) {
-            return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: title, description, userId, status" }) };
-        }
+        console.log("Valid request. Preparing to encrypt...");
 
-        console.log("Valid request. Preparing to insert into DynamoDB...");
+        // Encrypt the required fields using Lambda
+        let encryptedData;
+        try {
+            const encryptionResponse = await lambda.invoke({
+                FunctionName: ENCRYPTION_LAMBDA,
+                Payload: JSON.stringify({
+                    body: JSON.stringify({ id, title, description, userId, paymentType, status, SK: "METADATA" })
+                })
+            }).promise();
 
-        // Ensure TABLE_NAME is set correctly
-        if (!TABLE_NAME) {
-            return { statusCode: 500, body: JSON.stringify({ message: "DynamoDB table name is missing in environment variables" }) };
+            const encryptionResult = JSON.parse(encryptionResponse.Payload);
+            if (encryptionResult.statusCode !== 200) {
+                throw new Error(`Encryption failed: ${encryptionResult.body}`);
+            }
+
+            const parsedBody = JSON.parse(encryptionResult.body);
+            encryptedData = parsedBody.encryptedData;
+
+            if (!encryptedData || !encryptedData.id || !encryptedData.title || !encryptedData.userId || !encryptedData.SK) {
+                throw new Error("Encryption failed: Missing encrypted fields");
+            }
+        } catch (encryptionError) {
+            console.error("Encryption error:", encryptionError);
+            return { statusCode: 500, body: JSON.stringify({ message: "Encryption failed" }) };
         }
 
         // Construct item for DynamoDB
         const timestamp = new Date().toISOString();
         const item = {
-            PK: `CARD#${id}`,
-            SK: "METADATA",
-            GSI1PK: `STATUS#${status}`,
-            GSI1SK: `CARD#${id}`,
-            GSI2PK: `USER#${userId}`,
+            PK: `CARD#${encryptedData.id}`,
+            SK: encryptedData.SK,
+            GSI1PK: `STATUS#${encryptedData.status}`,
+            GSI1SK: `CARD#${encryptedData.id}`,
+            GSI2PK: `USER#${encryptedData.userId}`,
             GSI2SK: `CREATED_AT#${timestamp}`,
-            title,
-            description,
-            userId,
-            status,
+            title: encryptedData.title,
+            description: encryptedData.description,
+            userId: encryptedData.userId,
+            status: encryptedData.status,
             createdAt: timestamp,
         };
 
-        // ✅ Only add paymentType if it's provided
-        if (paymentType) {
-            item.paymentType = paymentType;
+        if (encryptedData.paymentType) {
+            item.paymentType = encryptedData.paymentType;
         }
 
         console.log("DynamoDB Item to Insert:", JSON.stringify(item, null, 2));
 
-        // Insert into DynamoDB
         try {
             await dynamoDB.put({ TableName: TABLE_NAME, Item: item }).promise();
             console.log("DynamoDB Inserted Successfully");
@@ -78,7 +92,7 @@ exports.handler = async (event) => {
 
         // Send event to SQS queue
         const sqsMessage = {
-            MessageBody: JSON.stringify({ id, title, userId, status }),
+            MessageBody: JSON.stringify({ id: encryptedData.id, title: encryptedData.title, userId: encryptedData.userId, status: encryptedData.status }),
             QueueUrl: QUEUE_URL,
         };
 

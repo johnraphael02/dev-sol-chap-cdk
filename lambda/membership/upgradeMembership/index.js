@@ -14,7 +14,7 @@ exports.handler = async (event) => {
         console.log("Received event:", JSON.stringify(event, null, 2));
 
         let body;
-        try {
+        try {came
             body = JSON.parse(event.body);
         } catch (parseError) {
             console.error("Invalid JSON format:", parseError);

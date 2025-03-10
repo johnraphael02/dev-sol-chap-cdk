@@ -1,122 +1,92 @@
 const AWS = require("aws-sdk");
-const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+// AWS Service Clients
+const dynamodb = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 
+// Environment Variables
 const MARKETPLACE_TABLE = process.env.MARKETPLACE_TABLE;
-const QUEUE_URL = process.env.QUEUE_URL;
-const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME; // EventBridge Bus Name
+const MARKETPLACE_QUEUE_URL = process.env.MARKETPLACE_QUEUE_URL;
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
 
 /**
- * Lambda Handler for Deleting a Marketplace
+ * Deletes a marketplace entry from DynamoDB
  */
 exports.handler = async (event) => {
+    console.log("🔍 Received Event:", JSON.stringify(event));
+
     try {
-        const marketplaceId = event.pathParameters?.id;
-
-        // Validate input
-        if (!marketplaceId) {
-            return sendResponse(400, { message: "Marketplace ID is required." });
+        const encryptedMarketplaceId = event.pathParameters?.id; // Encrypted ID from URL
+        if (!encryptedMarketplaceId) {
+            return { statusCode: 400, body: JSON.stringify({ message: "Missing encrypted marketplaceId" }) };
         }
 
-        // Check if Marketplace Exists Before Deleting
-        const getParams = {
+        console.log(`🔑 Encrypted marketplaceId from URL: ${encryptedMarketplaceId}`);
+
+        // 🔍 Construct PK for query
+        const encryptedPK = `MARKETPLACE#${encryptedMarketplaceId}`;
+
+        // 🔍 Retrieve the marketplace entry
+        const queryParams = {
             TableName: MARKETPLACE_TABLE,
-            Key: {
-                PK: `MARKETPLACE#${marketplaceId}`,
-                SK: "METADATA",
-            },
+            KeyConditionExpression: "PK = :pk",
+            ExpressionAttributeValues: { ":pk": encryptedPK },
         };
 
-        const existingMarketplace = await dynamoDB.get(getParams).promise();
+        console.log("📡 Querying DynamoDB:", JSON.stringify(queryParams, null, 2));
+        const queryResult = await dynamodb.query(queryParams).promise();
 
-        if (!existingMarketplace.Item) {
-            return sendResponse(404, { message: "Marketplace not found." });
+        if (!queryResult.Items || queryResult.Items.length === 0) {
+            console.error("❌ Marketplace entry not found.");
+            return { statusCode: 404, body: JSON.stringify({ message: "Marketplace entry not found" }) };
         }
 
-        // Optionally check the Status Index (e.g., check if it's "ACTIVE")
-        const statusParams = {
-            TableName: MARKETPLACE_TABLE,
-            IndexName: "StatusIndex",
-            KeyConditionExpression: "GSI1PK = :status",
-            ExpressionAttributeValues: {
-                ":status": `STATUS#ACTIVE`, // Replace with the status you want to check for
-            },
-        };
-        const statusResult = await dynamoDB.query(statusParams).promise();
+        // Extract SK from the retrieved item
+        const marketplaceItem = queryResult.Items[0];
+        const encryptedSK = marketplaceItem.SK;
 
-        if (statusResult.Items.length === 0) {
-            return sendResponse(400, { message: "Marketplace status is not ACTIVE and cannot be deleted." });
+        if (!encryptedSK) {
+            return { statusCode: 500, body: JSON.stringify({ message: "Marketplace SK is missing" }) };
         }
 
-        // Delete Marketplace from DynamoDB
+        console.log(`🔎 Found Encrypted SK: ${encryptedSK}`);
+
+        // 🔥 Perform delete operation
         const deleteParams = {
             TableName: MARKETPLACE_TABLE,
-            Key: {
-                PK: `MARKETPLACE#${marketplaceId}`,
-                SK: "METADATA",
-            },
+            Key: { PK: encryptedPK, SK: encryptedSK },
         };
 
-        await dynamoDB.delete(deleteParams).promise();
+        console.log("🗑️ Deleting marketplace entry from DynamoDB...");
+        await dynamodb.delete(deleteParams).promise();
+        console.log(`✅ Successfully deleted marketplace entry: ${encryptedMarketplaceId}`);
 
-        // Optionally, delete any associated records based on the secondary index if needed
-        /*
-        const deleteAssociatedParams = {
-            TableName: MARKETPLACE_TABLE,
-            IndexName: "StatusIndex",
-            KeyConditionExpression: "GSI1PK = :status AND GSI1SK = :marketplace",
-            ExpressionAttributeValues: {
-                ":status": `STATUS#ACTIVE`,
-                ":marketplace": `MARKETPLACE#${marketplaceId}`,
-            },
-        };
-
-        await dynamoDB.query(deleteAssociatedParams).promise();
-        */
-
-        // Send Message to SQS (MarketplaceQueue)
-        const sqsParams = {
-            QueueUrl: QUEUE_URL,
-            MessageBody: JSON.stringify({
-                action: "DELETE",
-                marketplaceId,
-                timestamp: new Date().toISOString(),
-            }),
-        };
-
-        await sqs.sendMessage(sqsParams).promise();
-
-        // Publish Event to EventBridge (MarketplaceDeleteEvent)
+        // 📢 Send delete event to EventBridge
         const eventParams = {
             Entries: [
                 {
-                    Source: "marketplace.service",
-                    EventBusName: EVENT_BUS_NAME,
+                    Source: "marketplace.system",
                     DetailType: "MarketplaceDeleted",
-                    Detail: JSON.stringify({
-                        marketplaceId,
-                        timestamp: new Date().toISOString(),
-                    }),
+                    Detail: JSON.stringify({ marketplaceId: encryptedMarketplaceId }),
+                    EventBusName: EVENT_BUS_NAME,
                 },
             ],
         };
-
         await eventBridge.putEvents(eventParams).promise();
+        console.log(`📢 EventBridge event published: MarketplaceDeleted ${encryptedMarketplaceId}`);
 
-        return sendResponse(200, { message: "Marketplace deleted successfully", marketplaceId });
+        // 📩 Send delete event to SQS
+        const sqsParams = {
+            QueueUrl: MARKETPLACE_QUEUE_URL,
+            MessageBody: JSON.stringify({ marketplaceId: encryptedMarketplaceId, action: "DELETE" }),
+        };
+        await sqs.sendMessage(sqsParams).promise();
+        console.log(`📩 SQS message sent for deleted marketplace entry: ${encryptedMarketplaceId}`);
+
+        return { statusCode: 200, body: JSON.stringify({ message: "Marketplace entry deleted successfully" }) };
     } catch (error) {
-        console.error("Error deleting marketplace:", error);
-        return sendResponse(500, { message: "Internal Server Error", error: error.message });
+        console.error("❌ Error deleting marketplace entry:", error);
+        return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
     }
-};
-
-/**
- * Helper function to send a response
- */
-const sendResponse = (statusCode, body) => {
-    return {
-        statusCode,
-        body: JSON.stringify(body),
-    };
 };
