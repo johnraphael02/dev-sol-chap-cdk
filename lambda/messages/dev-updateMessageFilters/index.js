@@ -1,61 +1,82 @@
-const AWS = require('aws-sdk');
+const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda(); // Add Lambda service
 
 const MESSAGE_FILTERS_TABLE = process.env.MESSAGE_FILTERS_TABLE;
-const QUEUE_URL = process.env.QUEUE_URL; // SQS Queue URL
-const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || 'default'; // EventBus Name
+const QUEUE_URL = process.env.QUEUE_URL;
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
+const ENCRYPTION_FUNCTION_NAME = "sol-chap-encryption"; // Encryption Lambda Function Name
 
 exports.handler = async (event) => {
     try {
         const requestBody = JSON.parse(event.body);
-        const filterId = requestBody.filterId;
-        const { name, pattern, action, enabled, metadata } = requestBody;
+        const { filterId, name, pattern, action, enabled, metadata } = requestBody;
 
         // Validate input fields
         if (!filterId || !name || !pattern || !action || enabled === undefined || !metadata) {
             return {
                 statusCode: 400,
-                body: JSON.stringify({ message: "Missing required fields: filterId, name, pattern, action, enabled, metadata" }),
+                body: JSON.stringify({
+                    message: "Missing required fields: filterId, name, pattern, action, enabled, metadata",
+                }),
             };
         }
 
-        // Define the MessageFilter structure
+        // Encrypt sensitive data before storing
+        const encryptionParams = {
+            FunctionName: ENCRYPTION_FUNCTION_NAME,
+            Payload: JSON.stringify({
+                body: JSON.stringify({ name, pattern, action, metadata }),
+            }),
+        };
+
+        const encryptionResponse = await lambda.invoke(encryptionParams).promise();
+        const encryptionResponseParsed = JSON.parse(encryptionResponse.Payload);
+
+        if (encryptionResponseParsed.statusCode >= 400) {
+            return {
+                statusCode: 500,
+                body: JSON.stringify({ error: "Failed to encrypt filter data" }),
+            };
+        }
+
+        const { name: encryptedName, pattern: encryptedPattern, action: encryptedAction, metadata: encryptedMetadata } =
+            JSON.parse(encryptionResponseParsed.body).encryptedData;
+
+        // Define the MessageFilter structure with encrypted fields
         const updatedFilter = {
             PK: `FILTER#${filterId}`,
-            SK: 'METADATA',
+            SK: "METADATA",
             filterId: filterId,
-            name: name,
-            pattern: pattern,
-            action: action,  // BLOCK, FLAG, or MODIFY
+            name: encryptedName,
+            pattern: encryptedPattern,
+            action: encryptedAction,
             enabled: enabled,
             createdAt: new Date().getTime(),
             updatedAt: new Date().getTime(),
-            metadata: metadata
+            metadata: encryptedMetadata,
         };
 
-        const params = {
+        // Store encrypted filter data in DynamoDB
+        await dynamoDB.put({
             TableName: MESSAGE_FILTERS_TABLE,
             Item: updatedFilter,
-        };
+        }).promise();
 
-        // Update filter data in DynamoDB
-        await dynamoDB.put(params).promise();
-
-        // Send message to SQS Queue
-        const sqsMessage = {
+        // Send encrypted filter data to SQS Queue
+        await sqs.sendMessage({
             QueueUrl: QUEUE_URL,
             MessageBody: JSON.stringify({
                 eventType: "UPDATE_MESSAGE_FILTER",
                 filterId: filterId,
                 filterData: updatedFilter,
             }),
-        };
-        await sqs.sendMessage(sqsMessage).promise();
+        }).promise();
 
-        // Trigger EventBridge Event
-        const eventParams = {
+        // Trigger an event in EventBridge
+        await eventBridge.putEvents({
             Entries: [
                 {
                     EventBusName: EVENT_BUS_NAME,
@@ -67,13 +88,12 @@ exports.handler = async (event) => {
                     }),
                 },
             ],
-        };
-        await eventBridge.putEvents(eventParams).promise();
+        }).promise();
 
         return {
             statusCode: 200,
             body: JSON.stringify({
-                message: "Filter updated successfully",
+                message: "Filter updated successfully with encrypted data",
                 filterId: filterId,
             }),
         };

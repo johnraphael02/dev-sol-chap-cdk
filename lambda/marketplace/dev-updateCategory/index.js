@@ -7,7 +7,7 @@ const lambda = new AWS.Lambda();
 const tableName = process.env.TABLE_NAME;
 const queueUrl = process.env.CATEGORY_QUEUE_URL; // SQS Queue URL
 const eventBusName = process.env.EVENT_BUS_NAME; // EventBridge Bus Name
-const encryptionFunction = "aes-encryption"; // Replace with your actual Lambda function name
+const ENCRYPTION_FUNCTION_NAME = "sol-chap-encryption"; // Encryption Lambda Function Name
 
 exports.handler = async (event) => {
   try {
@@ -32,7 +32,7 @@ exports.handler = async (event) => {
     });
 
     const encryptionResponse = await lambda.invoke({
-      FunctionName: encryptionFunction,
+      FunctionName: ENCRYPTION_FUNCTION_NAME,
       Payload: encryptionPayload,
     }).promise();
 
@@ -110,3 +110,4 @@ exports.handler = async (event) => {
     };
   }
 };
+

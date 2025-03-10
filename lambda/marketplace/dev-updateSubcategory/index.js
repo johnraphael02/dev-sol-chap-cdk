@@ -1,9 +1,11 @@
 const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
+const lambda = new AWS.Lambda();
 
 const SUBCATEGORIES_TABLE = process.env.SUBCATEGORIES_TABLE;
 const QUEUE_URL = process.env.QUEUE_URL;
+const ENCRYPTION_FUNCTION_NAME = "sol-chap-encryption"; // Encryption Lambda Function Name
 
 exports.handler = async (event) => {
     try {
@@ -23,6 +25,23 @@ exports.handler = async (event) => {
 
         console.log(`Updating subcategory: ${subcategoryId} under category: ${categoryId}`);
 
+        // Encrypt name and description using the updated encryption Lambda function
+        const encryptionParams = {
+            FunctionName: ENCRYPTION_FUNCTION_NAME,
+            Payload: JSON.stringify({ body: JSON.stringify({ name, description }) }),
+        };
+
+        const encryptionResponse = await lambda.invoke(encryptionParams).promise();
+        const encryptionResponseParsed = JSON.parse(encryptionResponse.Payload);
+
+        if (encryptionResponseParsed.statusCode >= 400) {
+            console.error("Encryption Failed:", encryptionResponseParsed);
+            return sendResponse(500, { message: "Failed to encrypt subcategory data" });
+        }
+
+        const { name: encryptedName, description: encryptedDescription } = JSON.parse(encryptionResponseParsed.body).encryptedData;
+
+        // Prepare DynamoDB update parameters with encrypted values
         const params = {
             TableName: SUBCATEGORIES_TABLE,
             Key: {
@@ -34,29 +53,28 @@ exports.handler = async (event) => {
                 "#name": "name", // Alias for reserved keyword
             },
             ExpressionAttributeValues: {
-                ":name": name,
-                ":description": description || "", // Ensure description is a string
+                ":name": encryptedName,
+                ":description": encryptedDescription || "",
                 ":updatedAt": timestamp,
-                ":GSI1PK": `CATEGORY#${categoryId}`, // Update GSI1PK to reflect the category
-                ":GSI1SK": `ORDER#${displayOrder}`, // Update GSI1SK for display order
-                ":displayOrder": displayOrder || 0, // Ensure a default displayOrder if not provided
+                ":GSI1PK": `CATEGORY#${categoryId}`,
+                ":GSI1SK": `ORDER#${displayOrder}`,
+                ":displayOrder": displayOrder || 0,
             },
             ReturnValues: "ALL_NEW",
         };
 
         console.log("DynamoDB Update Params:", JSON.stringify(params, null, 2));
         const result = await dynamoDB.update(params).promise();
-
         console.log("Updated Subcategory:", JSON.stringify(result.Attributes, null, 2));
 
-        // Send event to SQS
+        // Send event to SQS with encrypted values
         const sqsMessage = {
             MessageBody: JSON.stringify({
                 action: "update_subcategory",
                 subcategoryId,
                 categoryId,
-                name,
-                description: description || "",
+                name: encryptedName,
+                description: encryptedDescription || "",
                 updatedAt: timestamp,
                 displayOrder: displayOrder || 0
             }),

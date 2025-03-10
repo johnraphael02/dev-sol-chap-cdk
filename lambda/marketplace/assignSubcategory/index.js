@@ -5,6 +5,7 @@ const eventBridge = new AWS.EventBridge();
 
 const SECTIONS_TABLE = process.env.SECTIONS_TABLE;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
+const ENCRYPTION_FUNCTION_NAME = "sol-chap-encryption"; // Encryption Lambda Function Name
 
 exports.handler = async (event) => {
     try {
@@ -43,9 +44,9 @@ exports.handler = async (event) => {
             let encryptedData;
             try {
                 const encryptionResponse = await lambda.invoke({
-                    FunctionName: "aes-encryption",
+                    FunctionName: ENCRYPTION_FUNCTION_NAME, // Using the updated function name
                     Payload: JSON.stringify({
-                        data: { sectionId, subcategoryId, name, displayRules, filters }
+                        body: JSON.stringify({ sectionId, subcategoryId, name, displayRules, filters })
                     })
                 }).promise();
 
@@ -56,7 +57,7 @@ exports.handler = async (event) => {
                 const parsedBody = JSON.parse(encryptionResult.body);
                 console.log("Parsed body from encryption result:", parsedBody);
 
-                encryptedData = parsedBody.encryptedData?.data;
+                encryptedData = parsedBody.encryptedData;
 
                 if (!encryptedData || !encryptedData.sectionId || !encryptedData.subcategoryId || !encryptedData.name) {
                     throw new Error("Encryption failed: Missing encrypted fields");

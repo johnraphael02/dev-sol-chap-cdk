@@ -1,7 +1,9 @@
-const AWS = require('aws-sdk');
+const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
+const lambda = new AWS.Lambda();
 
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME || "Subcategories";
+const DECRYPTION_FUNCTION_NAME = "sol-chap-decryption"; // Updated to call decryption function
 
 exports.handler = async (event) => {
     console.log("Received event:", JSON.stringify(event, null, 2));
@@ -10,14 +12,14 @@ exports.handler = async (event) => {
         // Extract category ID from path parameters
         const categoryId = event.pathParameters?.id;
         if (!categoryId) {
-            console.warn(" Missing Category ID in request.");
+            console.warn("Missing Category ID in request.");
             return {
                 statusCode: 400,
                 body: JSON.stringify({ error: "Category ID is required." }),
             };
         }
 
-        // DynamoDB Scan Parameters ( Less Efficient)
+        // DynamoDB Scan Parameters (Less Efficient)
         const params = {
             TableName: TABLE_NAME,
             FilterExpression: "SK = :categoryId",
@@ -26,7 +28,7 @@ exports.handler = async (event) => {
             },
         };
 
-        console.log(" Scanning DynamoDB with params:", JSON.stringify(params, null, 2));
+        console.log("Scanning DynamoDB with params:", JSON.stringify(params, null, 2));
 
         // Execute Scan
         const result = await dynamoDB.scan(params).promise();
@@ -47,9 +49,20 @@ exports.handler = async (event) => {
 
         console.log("Successfully fetched subcategories:", JSON.stringify(subcategories, null, 2));
 
+        // Invoke the decryption function
+        const decryptionParams = {
+            FunctionName: DECRYPTION_FUNCTION_NAME,
+            Payload: JSON.stringify({ body: JSON.stringify(subcategories) }),
+        };
+
+        const decryptionResponse = await lambda.invoke(decryptionParams).promise();
+        const decryptedData = JSON.parse(decryptionResponse.Payload);
+
+        console.log("Decrypted subcategories:", JSON.stringify(decryptedData, null, 2));
+
         return {
             statusCode: 200,
-            body: JSON.stringify(subcategories),
+            body: JSON.stringify(decryptedData),
         };
     } catch (error) {
         console.error("Error fetching subcategories:", error);

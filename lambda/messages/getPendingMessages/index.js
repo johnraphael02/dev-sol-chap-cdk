@@ -6,7 +6,7 @@ const sqs = new AWS.SQS();
 
 const TABLE_NAME = process.env.MESSAGES_TABLE;
 const REVIEW_QUEUE_URL = process.env.REVIEW_QUEUE_URL;
-const decryptionFunction = "aes-decryption";
+const DECRYPTION_FUNCTION_NAME = "sol-chap-deccryption"; // Decryption Lambda Function Name
 
 exports.handler = async (event) => {
   try {
@@ -23,24 +23,24 @@ exports.handler = async (event) => {
     const data = await dynamoDB.scan(params).promise();
     let messages = data.Items || [];
 
-    // Decrypt each message
+    // Decrypt each message using the decryption function
     for (let message of messages) {
       try {
         const decryptionResponse = await lambda.invoke({
-          FunctionName: decryptionFunction,
+          FunctionName: DECRYPTION_FUNCTION_NAME,
           Payload: JSON.stringify({
-            data: {
+            body: JSON.stringify({
               senderId: message.senderId,
               receiverId: message.receiverId,
               message: message.message,
               subject: message.subject,
               policy: message.policy,
-            },
+            }),
           }),
         }).promise();
 
         const decryptionResult = JSON.parse(decryptionResponse.Payload);
-        const decryptedData = JSON.parse(decryptionResult.body).decryptedData?.data;
+        const decryptedData = JSON.parse(decryptionResult.body).decryptedData;
 
         if (!decryptedData) {
           throw new Error("Decryption failed");

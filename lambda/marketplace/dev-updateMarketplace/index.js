@@ -4,6 +4,8 @@ const lambda = new AWS.Lambda();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 
+const ENCRYPTION_FUNCTION_NAME = "sol-chap-encryption"; // Encryption Lambda Function Name
+
 /**
  * Send message to MarketplaceQueue (SQS)
  */
@@ -58,25 +60,32 @@ exports.handler = async (event) => {
             return { statusCode: 404, body: JSON.stringify({ message: "Marketplace not found" }) };
         }
 
-        // Encrypt sensitive data before updating
-        const encryptionParams = {
-            FunctionName: process.env.ENCRYPTION_LAMBDA,
-            Payload: JSON.stringify({ body: JSON.stringify(body) }),
-        };
+        // 🔐 Encrypt sensitive data before updating
+        const encryptionPayload = JSON.stringify({
+            data: {
+                name: body.name,
+                description: body.description || '',
+                status: body.status || existingItem.Item.status,
+                settings: body.settings || existingItem.Item.settings,
+            },
+        });
 
-        const encryptionResponse = await lambda.invoke(encryptionParams).promise();
-        const encryptionResponseParsed = JSON.parse(encryptionResponse.Payload);
+        const encryptionResponse = await lambda.invoke({
+            FunctionName: ENCRYPTION_FUNCTION_NAME,
+            Payload: encryptionPayload,
+        }).promise();
 
-        if (encryptionResponseParsed.statusCode >= 400) {
-            return { statusCode: 500, body: JSON.stringify({ message: "Failed to encrypt data" }) };
+        const encryptionResult = JSON.parse(encryptionResponse.Payload);
+        const encryptedData = JSON.parse(encryptionResult.body).encryptedData?.data;
+
+        if (!encryptedData) {
+            throw new Error("Encryption failed");
         }
-
-        const encryptedData = JSON.parse(encryptionResponseParsed.body).encryptedData;
 
         // Prepare updated attributes
         const updatedItem = {
             ...existingItem.Item,
-            ...encryptedData, // Merge new encrypted data
+            ...encryptedData, // Merge encrypted data
             updatedAt: Math.floor(Date.now() / 1000),
         };
 
@@ -98,3 +107,4 @@ exports.handler = async (event) => {
         return { statusCode: 500, body: JSON.stringify({ message: error.message || "Internal Server Error" }) };
     }
 };
+
