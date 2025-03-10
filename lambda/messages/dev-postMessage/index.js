@@ -4,7 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const lambda = new AWS.Lambda();
 
 const TABLE_NAME = process.env.MESSAGES_TABLE;
-const encryptionFunction = "aes-encryption";
+const encryptionFunction = "sol-chap-encryption";
 
 exports.handler = async (event) => {
   try {
@@ -21,11 +21,19 @@ exports.handler = async (event) => {
     const timestamp = new Date().toISOString();
     const messageId = uuidv4();
 
-    // Encrypt sensitive fields
+    // Encrypt all fields, including PK and SK
     const encryptionResponse = await lambda.invoke({
       FunctionName: encryptionFunction,
       Payload: JSON.stringify({
-        data: { senderId, receiverId, message, subject, policy }
+        data: { 
+          PK: `MESSAGE#${messageId}`, 
+          SK: `STATUS#PENDING`,
+          senderId, 
+          receiverId, 
+          message, 
+          subject, 
+          policy 
+        }
       })
     }).promise();
 
@@ -36,30 +44,23 @@ exports.handler = async (event) => {
       throw new Error("Encryption failed");
     }
 
-    // Unique partition key for the message
-    const PK = `MESSAGE#${messageId}`;
-    // Sort key set to "STATUS#PENDING"
-    const SK = `STATUS#PENDING`;
-
-    // Setting status to "PENDING"
-    const status = "PENDING";
-
+    // Store encrypted values in DynamoDB
     const params = {
       TableName: TABLE_NAME,
       Item: {
-        PK,
-        SK,  // Set SK to STATUS#PENDING
+        PK: encryptedData.PK, // Encrypted PK
+        SK: encryptedData.SK, // Encrypted SK
         senderId: encryptedData.senderId,
         receiverId: encryptedData.receiverId,
         message: encryptedData.message,
-        subject: encryptedData.subject,  // Encrypted Subject (if applicable)
-        policy: encryptedData.policy,   // Encrypted Policy (if applicable)
-        timestamp,
-        status,  // Default status set to "PENDING"
-        GSI1PK: `STATUS#PENDING`,  // GSI1PK for querying by status (set to "PENDING")
-        GSI1SK: `CREATED_AT#${timestamp}`,  // GSI1SK for filtering by timestamp
-        GSI2PK: `USER#${encryptedData.receiverId}`,  // GSI2PK for querying messages by userId
-        GSI2SK: `CREATED_AT#${timestamp}`,  // GSI2SK for filtering by userId and timestamp
+        subject: encryptedData.subject,
+        policy: encryptedData.policy,
+        timestamp,  // Only timestamp remains unencrypted
+        status: "PENDING",
+        GSI1PK: encryptedData.SK, // Using encrypted SK as status index
+        GSI1SK: `CREATED_AT#${timestamp}`,
+        GSI2PK: encryptedData.receiverId,
+        GSI2SK: `CREATED_AT#${timestamp}`,
       },
     };
 

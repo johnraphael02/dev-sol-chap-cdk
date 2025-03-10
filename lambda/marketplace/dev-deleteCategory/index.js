@@ -57,20 +57,9 @@ exports.handler = async (event) => {
 
         console.log(`🔑 Category ID to encrypt: ${categoryId}`);
 
-        // Step 1: Call the AES Decryption Lambda function
-        const lambdaParams = {
-            FunctionName: "aes-decryption",
-            Payload: JSON.stringify({ encryptedText: encryptedCategoryId }),
-        };
-        const lambdaResponse = await lambda.invoke(lambdaParams).promise();
-        const decryptedData = JSON.parse(lambdaResponse.Payload);
-
-        if (!decryptedData || !decryptedData.decryptedText) {
-            return { statusCode: 500, body: JSON.stringify({ message: "Decryption failed" }) };
-        }
-
-        const categoryId = decryptedData.decryptedText;
-        console.log(`✅ Decrypted Category ID: ${categoryId}`);
+        // 🔐 Step 1: Encrypt CATEGORY#<id>
+        const encryptedCategoryPK = await encryptText(`CATEGORY#${categoryId}`);
+        console.log(`✅ Encrypted PK: ${encryptedCategoryPK}`);
 
         // 🔎 Step 2: Retrieve category details from DynamoDB
         const getParams = {

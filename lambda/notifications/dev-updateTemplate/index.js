@@ -5,7 +5,7 @@ const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
 
-const TABLE_NAME = process.env.TEMPLATES_TABLE_NAME || "Templates";
+const TABLE_NAME = process.env.TEMPLATES_TABLE_NAME || "-Dev-Templates";
 const QUEUE_URL = process.env.TEMPLATE_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
 // Use the encryption function name from environment or default to "aes-encryption"

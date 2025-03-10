@@ -45,9 +45,9 @@ exports.handler = async (event) => {
         console.log("Parsed encryption result:", encryptionResult);
 
         const parsedEncryptionBody = JSON.parse(encryptionResult.body);
-        const encryptedData = parsedEncryptionBody.encryptedData?.data;
+        const encryptedData = parsedEncryptionBody.encryptedData;
 
-        if (!encryptedData) {
+        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipLevel || !encryptedData.email) {
             throw new Error("Encryption failed: missing encrypted data");
         }
 

@@ -1,10 +1,25 @@
 const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
+const lambda = new AWS.Lambda();
 
 // Environment variables
 const MESSAGES_TABLE = process.env.MESSAGES_TABLE;
 const SUBJECT_QUEUE_URL = process.env.QUEUE_URL;
+const ENCRYPTION_FUNCTION = "sol-chap-encryption"; // Encryption Lambda function
+
+/**
+ * Calls the encryption Lambda function
+ */
+const encrypt = async (data) => {
+    const params = {
+        FunctionName: ENCRYPTION_FUNCTION,
+        Payload: JSON.stringify({ data }),
+    };
+    const response = await lambda.invoke(params).promise();
+    const encryptedData = JSON.parse(response.Payload);
+    return encryptedData.encrypted;
+};
 
 /**
  * Lambda Function: reviewSubject
@@ -25,13 +40,19 @@ exports.handler = async (event) => {
 
         const timestamp = new Date().toISOString();
 
+        // Encrypt sensitive fields using Lambda
+        const encryptedMessageId = await encrypt(messageId);
+        const encryptedSubject = await encrypt(subject);
+        const encryptedPK = await encrypt(`MESSAGE#${messageId}`);
+        const encryptedSK = await encrypt("SUBJECT");
+
         const params = {
             TableName: MESSAGES_TABLE,
-            Key: { PK: `MESSAGE#${messageId}`, SK: "SUBJECT" },
+            Key: { PK: encryptedPK, SK: encryptedSK },
             UpdateExpression: "SET #s = :subject, updatedAt = :updatedAt",
             ExpressionAttributeNames: { "#s": "subject" },
             ExpressionAttributeValues: {
-                ":subject": subject,
+                ":subject": encryptedSubject,
                 ":updatedAt": timestamp,
             },
             ReturnValues: "UPDATED_NEW",
@@ -47,8 +68,8 @@ exports.handler = async (event) => {
             QueueUrl: SUBJECT_QUEUE_URL,
             MessageBody: JSON.stringify({
                 action: "SUBJECT_UPDATED",
-                messageId,
-                subject,
+                messageId: encryptedMessageId,
+                subject: encryptedSubject,
                 updatedAt: timestamp,
             }),
         };
@@ -72,5 +93,3 @@ const sendResponse = (statusCode, body) => ({
     statusCode,
     body: JSON.stringify(body),
 });
-
-

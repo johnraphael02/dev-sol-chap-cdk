@@ -4,7 +4,7 @@ const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
 
-const TABLE_NAME = process.env.MESSAGES_TABLE_NAME || "Messages";
+const TABLE_NAME = process.env.MESSAGES_TABLE_NAME || "Dev-Messages";
 const QUEUE_URL = process.env.MESSAGE_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
 const ENCRYPTION_LAMBDA = "sol-chap-encryption";
@@ -29,24 +29,36 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: id, userId, content, status" }) };
         }
 
-        const encryptedContent = await encryptText({ content });
-        if (!encryptedContent) {
-            throw new Error("Encryption failed for content");
-        }
-
-        console.log("Valid request. Preparing to insert into DynamoDB...");
-
         const createdAt = timestamp || new Date().toISOString();
-        const item = {
+
+        // Encrypt PK, SK, content, status, and indexes
+        const encryptedData = await encryptText({
             PK: `MESSAGE#${id}`,
             SK: `USER#${userId}`,
             GSI1PK: `STATUS#${status}`,
             GSI1SK: `CREATED_AT#${createdAt}`,
             GSI2PK: `USER#${userId}`,
             GSI2SK: `CREATED_AT#${createdAt}`,
-            content: encryptedContent,
-            status,
-            timestamp: createdAt,
+            content,
+            status
+        });
+
+        if (!encryptedData) {
+            throw new Error("Encryption failed.");
+        }
+
+        console.log("Encrypted Data:", JSON.stringify(encryptedData, null, 2));
+
+        const item = {
+            PK: encryptedData.PK,
+            SK: encryptedData.SK,
+            GSI1PK: encryptedData.GSI1PK,
+            GSI1SK: encryptedData.GSI1SK,
+            GSI2PK: encryptedData.GSI2PK,
+            GSI2SK: encryptedData.GSI2SK,
+            content: encryptedData.content,
+            status: encryptedData.status,
+            timestamp: createdAt, // Timestamp remains unencrypted
         };
 
         console.log("DynamoDB Item to Insert:", JSON.stringify(item, null, 2));
@@ -59,7 +71,13 @@ exports.handler = async (event) => {
                 console.log("Attempting to send message to SQS...");
                 await sqs.sendMessage({
                     QueueUrl: QUEUE_URL,
-                    MessageBody: JSON.stringify({ id, userId, content: encryptedContent, status, action: "create" }),
+                    MessageBody: JSON.stringify({
+                        id,
+                        userId,
+                        content: encryptedData.content,
+                        status: encryptedData.status,
+                        action: "create",
+                    }),
                 }).promise();
                 console.log("SQS Message Sent:", id);
             } catch (sqsError) {
@@ -74,7 +92,12 @@ exports.handler = async (event) => {
                     {
                         Source: "messages.service",
                         DetailType: "MessageCreateEvent",
-                        Detail: JSON.stringify({ id, userId, content: encryptedContent, status }),
+                        Detail: JSON.stringify({
+                            id,
+                            userId,
+                            content: encryptedData.content,
+                            status: encryptedData.status,
+                        }),
                         EventBusName: EVENT_BUS_NAME,
                     },
                 ],
@@ -119,7 +142,7 @@ async function encryptText(data) {
             throw new Error("Encryption Lambda response is missing 'encryptedData'.");
         }
 
-        return parsedBody.encryptedData.content;
+        return parsedBody.encryptedData;
     } catch (error) {
         console.error("Encryption error:", error);
         throw error;

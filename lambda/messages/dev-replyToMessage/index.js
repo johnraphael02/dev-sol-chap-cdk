@@ -4,10 +4,9 @@ const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
-const encryptionFunction = "aes-encryption";
+const encryptionFunction = "sol-chap-encryption";
 
 const tableName = process.env.MESSAGE_TABLE;
-const FILTER_QUEUE_URL = process.env.FILTER_QUEUE_URL;
 const REPLY_QUEUE_URL = process.env.REPLY_QUEUE_URL;
 
 exports.handler = async (event) => {
@@ -31,11 +30,19 @@ exports.handler = async (event) => {
 
         const timestamp = new Date().toISOString();
 
-        // Encrypt fields
+        // Encrypt all fields, including PK and SK
         const encryptionResponse = await lambda.invoke({
             FunctionName: encryptionFunction,
             Payload: JSON.stringify({
-                data: { messageId, senderId, receiverId, messageText, replyText }
+                data: { 
+                    PK: `MESSAGE#${messageId}`, 
+                    SK: `REPLIES#${timestamp}`,
+                    messageId,
+                    senderId, 
+                    receiverId, 
+                    messageText, 
+                    replyText 
+                }
             })
         }).promise();
 
@@ -46,25 +53,22 @@ exports.handler = async (event) => {
             throw new Error("Encryption failed");
         }
 
-        // Store the reply in DynamoDB
-        const pk = `MESSAGE#${encryptedData.messageId}`;
-        const skReplies = `REPLIES#${timestamp}`;
-
+        // Store the encrypted reply in DynamoDB
         await dynamoDB.put({
             TableName: tableName,
             Item: {
-                PK: pk,
-                SK: skReplies,
+                PK: encryptedData.PK,  // Encrypted PK
+                SK: encryptedData.SK,  // Encrypted SK
                 replyText: encryptedData.replyText,
                 senderId: encryptedData.senderId,
                 receiverId: encryptedData.receiverId,
-                timestamp,
-                GSI2PK: `USER#${encryptedData.receiverId}`,
+                timestamp, // Unencrypted
+                GSI2PK: encryptedData.receiverId,
                 GSI2SK: `CREATED_AT#${timestamp}`
             }
         }).promise();
 
-        // Send event to SQS queue
+        // Send encrypted event to SQS queue
         await sqs.sendMessage({
             QueueUrl: REPLY_QUEUE_URL,
             MessageBody: JSON.stringify({
@@ -75,7 +79,7 @@ exports.handler = async (event) => {
             })
         }).promise();
 
-        // Publish event to EventBridge
+        // Publish encrypted event to EventBridge
         await eventBridge.putEvents({
             Entries: [
                 {
