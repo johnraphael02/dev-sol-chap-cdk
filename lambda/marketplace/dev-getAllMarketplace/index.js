@@ -8,44 +8,35 @@ const DECRYPTION_LAMBDA_NAME = process.env.DECRYPTION_LAMBDA_NAME;
 
 exports.handler = async (event) => {
   try {
-    // ✅ Fetch all items from the Marketplace table
-    const params = {
-      TableName: MARKETPLACE_TABLE,
-    };
-
-    const result = await dynamodb.scan(params).promise();
+    const result = await dynamodb.scan({ TableName: MARKETPLACE_TABLE }).promise();
     const encryptedItems = result.Items || [];
 
-    // ✅ Function to decrypt a single field
-    const decryptField = async (encryptedText) => {
-      if (!encryptedText) return encryptedText; // Return as is if undefined
+    const decryptField = async (fieldName, encryptedValue) => {
+      if (!encryptedValue) return encryptedValue;
+
       try {
-        const decryptionParams = {
+        const params = {
           FunctionName: DECRYPTION_LAMBDA_NAME,
-          Payload: JSON.stringify({ encryptedText }), // ✅ Send only the required field
+          Payload: JSON.stringify({ [fieldName]: encryptedValue }),
         };
 
-        console.log("📩 Sending to Decryption Lambda:", JSON.stringify(decryptionParams, null, 2));
+        const response = await lambda.invoke(params).promise();
+        const parsedPayload = JSON.parse(response.Payload || "{}");
+        const body = parsedPayload.body ? JSON.parse(parsedPayload.body) : {};
+        const decryptedData = body.decryptedData || {};
+        const decryptedValue = decryptedData[fieldName];
 
-        const decryptionResponse = await lambda.invoke(decryptionParams).promise();
-
-        // ✅ Ensure proper JSON parsing
-        const parsedPayload = JSON.parse(decryptionResponse.Payload);
-        const decryptedData = parsedPayload.decryptedData || encryptedText; // Fallback to original if undefined
-
-        console.log("✅ Decrypted Data:", decryptedData);
-        return decryptedData;
-      } catch (error) {
-        console.error("❌ Error decrypting field:", error);
-        return encryptedText; // Return encrypted value if decryption fails
+        return decryptedValue || encryptedValue;
+      } catch (err) {
+        console.error(`❌ Error decrypting ${fieldName}:`, err.message);
+        return encryptedValue;
       }
     };
 
-    // ✅ Decrypt all items in parallel
     const decryptedItems = await Promise.all(
       encryptedItems.map(async (item) => {
-        const decryptedName = await decryptField(item.name);
-        const decryptedDescription = await decryptField(item.description);
+        const decryptedName = await decryptField("name", item.name);
+        const decryptedDescription = await decryptField("description", item.description);
 
         return {
           ...item,
@@ -58,15 +49,18 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       body: JSON.stringify({
-        message: "Fetched Marketplace items successfully",
+        message: "Fetched and decrypted marketplace items successfully",
         data: decryptedItems,
       }),
     };
   } catch (error) {
-    console.error("❌ Error fetching Marketplace items:", error);
+    console.error("❌ Error in getAllMarketplace:", error.message);
     return {
       statusCode: 500,
-      body: JSON.stringify({ message: "Error fetching marketplace items", error }),
+      body: JSON.stringify({
+        message: "Error in getAllMarketplace",
+        error: error.message,
+      }),
     };
   }
 };
