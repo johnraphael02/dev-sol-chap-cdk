@@ -3,8 +3,9 @@ const AWS = require('aws-sdk');
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
-const encryptionFunction = "aes-encryption";
+const lambda = new AWS.Lambda();
 
+const encryptionFunction = "sol-chap-encryption";
 const tableName = process.env.MESSAGE_TABLE;  // DynamoDB Table
 const FILTER_QUEUE_URL = process.env.FILTER_QUEUE_URL;  // SQS Queue
 
@@ -21,25 +22,17 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON format" }) };
         }
 
-        const { messageId, senderId, receiverId, messageText } = body;
+        const { messageId, senderId, receiverId, message } = body;
 
         // Validate required fields
-        if (!messageId || !messageText || !senderId || !receiverId) {
+        if (!messageId || !message || !senderId || !receiverId) {
             return { statusCode: 400, body: JSON.stringify({ error: "Missing required fields" }) };
         }
 
         const timestamp = new Date().toISOString();
 
-        // Encrypt fields
-        const encryptionResponse = await new AWS.Lambda().invoke({
-            FunctionName: encryptionFunction,
-            Payload: JSON.stringify({
-                data: { messageId, senderId, receiverId, messageText }
-            })
-        }).promise();
-
-        const encryptionResult = JSON.parse(encryptionResponse.Payload);
-        const encryptedData = JSON.parse(encryptionResult.body).encryptedData?.data;
+        // Encrypt fields except timestamp
+        const encryptedData = await encryptData({ messageId, senderId, receiverId, message });
 
         if (!encryptedData) {
             throw new Error("Encryption failed");
@@ -47,7 +40,7 @@ exports.handler = async (event) => {
 
         // ✅ Contact Info Filter
         const contactPattern = /(email|phone|contact|@|\d{10,})/i;
-        const containsContactInfo = contactPattern.test(messageText);
+        const containsContactInfo = contactPattern.test(message);
 
         if (containsContactInfo) {
             // ✅ Store in DynamoDB (Updated Schema)
@@ -56,15 +49,15 @@ exports.handler = async (event) => {
                 await dynamoDB.put({
                     TableName: tableName,
                     Item: {
-                        PK: `MESSAGE#${encryptedData.messageId}`,         // Partition Key (Encrypted Message ID)
-                        SK: `FILTER#${timestamp}`,          // Sort Key (FILTER + Timestamp)
-                        GSI1PK: `STATUS#FLAGGED`,          // GSI for Status index (flagged status)
-                        GSI1SK: `CREATED_AT#${timestamp}`, // GSI for timestamp sorting
-                        GSI2PK: `USER#${encryptedData.senderId}`,        // GSI for User index (encrypted sender)
-                        GSI2SK: `CREATED_AT#${timestamp}`, // GSI for timestamp sorting
+                        PK: encryptedData.PK,
+                        SK: encryptedData.SK,
+                        GSI1PK: encryptedData.GSI1PK,
+                        GSI1SK: encryptedData.GSI1SK,
+                        GSI2PK: encryptedData.GSI2PK,
+                        GSI2SK: encryptedData.GSI2SK,
                         senderId: encryptedData.senderId,
                         receiverId: encryptedData.receiverId,
-                        messageText: encryptedData.messageText,
+                        message: encryptedData.message,
                         timestamp,
                         status: "FLAGGED"
                     }
@@ -80,7 +73,13 @@ exports.handler = async (event) => {
                 try {
                     console.log("Sending flagged message to SQS...");
                     await sqs.sendMessage({
-                        MessageBody: JSON.stringify({ messageId: encryptedData.messageId, senderId: encryptedData.senderId, receiverId: encryptedData.receiverId, messageText: encryptedData.messageText, timestamp }),
+                        MessageBody: JSON.stringify({
+                            messageId: encryptedData.messageId,
+                            senderId: encryptedData.senderId,
+                            receiverId: encryptedData.receiverId,
+                            message: encryptedData.message,
+                            timestamp
+                        }),
                         QueueUrl: FILTER_QUEUE_URL,
                     }).promise();
                     console.log("Message sent to SQS");
@@ -100,7 +99,13 @@ exports.handler = async (event) => {
                         {
                             Source: "aws.messages",
                             DetailType: "FilterContactInfo",
-                            Detail: JSON.stringify({ messageId: encryptedData.messageId, senderId: encryptedData.senderId, receiverId: encryptedData.receiverId, messageText: encryptedData.messageText, timestamp }),
+                            Detail: JSON.stringify({
+                                messageId: encryptedData.messageId,
+                                senderId: encryptedData.senderId,
+                                receiverId: encryptedData.receiverId,
+                                message: encryptedData.message,
+                                timestamp
+                            }),
                             EventBusName: "default",
                         },
                     ],
@@ -118,3 +123,35 @@ exports.handler = async (event) => {
         return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
     }
 };
+
+async function encryptData(data) {
+    try {
+        const encryptionResponse = await lambda.invoke({
+            FunctionName: encryptionFunction,
+            Payload: JSON.stringify({ data })
+        }).promise();
+
+        const encryptionResult = JSON.parse(encryptionResponse.Payload);
+        const encryptedData = JSON.parse(encryptionResult.body).encryptedData?.data;
+
+        if (!encryptedData) {
+            throw new Error("Encryption failed");
+        }
+
+        return {
+            messageId: encryptedData.messageId,
+            senderId: encryptedData.senderId,
+            receiverId: encryptedData.receiverId,
+            message: encryptedData.message,
+            PK: `MESSAGE#${encryptedData.messageId}`,
+            SK: `FILTER#${new Date().toISOString()}`,
+            GSI1PK: `STATUS#FLAGGED`,
+            GSI1SK: `CREATED_AT#${new Date().toISOString()}`,
+            GSI2PK: `USER#${encryptedData.senderId}`,
+            GSI2SK: `CREATED_AT#${new Date().toISOString()}`
+        };
+    } catch (error) {
+        console.error("Encryption error:", error);
+        throw error;
+    }
+}

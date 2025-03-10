@@ -1,6 +1,7 @@
 {
-  "name": "dev-marketplace",
+  "name": "dev-getallmarketplace",
   "version": "1.0.0",
+  "description": "",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -8,5 +9,8 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "type": "commonjs",
+  "dependencies": {
+    "aws-sdk": "^2.1692.0"
+  }
 }

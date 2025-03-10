@@ -3,18 +3,30 @@ const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda();
 
-// Use the existing "Messages" table
-const TABLE_NAME = process.env.MESSAGES_TABLE_NAME || "Messages";
+const TABLE_NAME = process.env.MESSAGES_TABLE_NAME || "Dev-Messages";
 const QUEUE_URL = process.env.DETAIL_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
-const COGNITO_POOL = process.env.COGNITO_POOL;
+const ENCRYPTION_FUNCTION = "sol-chap-encryption"; // Encryption Lambda function
+
+/**
+ * Calls the encryption Lambda function
+ */
+async function encryptData(data) {
+    const params = {
+        FunctionName: ENCRYPTION_FUNCTION,
+        Payload: JSON.stringify({ data }),
+    };
+    const response = await lambda.invoke(params).promise();
+    const encryptedData = JSON.parse(response.Payload);
+    return encryptedData.encrypted;
+}
 
 exports.handler = async (event) => {
     try {
         console.log("Received event:", JSON.stringify(event, null, 2));
 
-        // Parse request body safely
         let body;
         try {
             body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
@@ -25,7 +37,6 @@ exports.handler = async (event) => {
 
         console.log("Parsed request body:", body);
 
-        // Extract required fields
         const { id, fromUserId, toUserId, notes, adminId } = body;
 
         if (!id || !fromUserId || !toUserId || !notes || !adminId) {
@@ -33,27 +44,37 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: id, fromUserId, toUserId, notes, adminId" }) };
         }
 
-        console.log("Valid request. Preparing to insert into DynamoDB...");
+        console.log("Encrypting all data...");
+        const encryptedId = await encryptData(id);
+        const encryptedFromUserId = await encryptData(fromUserId);
+        const encryptedToUserId = await encryptData(toUserId);
+        const encryptedNotes = await encryptData(notes);
+        const encryptedAdminId = await encryptData(adminId);
+        const encryptedPK = await encryptData(`MESSAGE#${id}`);
+        const encryptedSK = await encryptData("DETAILS");
+        const encryptedGSI1PK = await encryptData(`USER#${fromUserId}`);
+        const encryptedGSI1SK = await encryptData(`CREATED_AT`);
+        const encryptedGSI2PK = await encryptData(`USER#${toUserId}`);
+        const encryptedGSI2SK = await encryptData(`CREATED_AT`);
 
-        // Construct item for DynamoDB
         const reviewedAt = new Date().toISOString();
+
         const item = {
-            PK: `MESSAGE#${id}`,
-            SK: "DETAILS",
-            GSI1PK: `USER#${fromUserId}`,
-            GSI1SK: `CREATED_AT#${reviewedAt}`,
-            GSI2PK: `USER#${toUserId}`,
-            GSI2SK: `CREATED_AT#${reviewedAt}`,
-            fromUserId,
-            toUserId,
-            notes,
-            reviewedBy: adminId,
-            reviewedAt,
+            PK: encryptedPK,
+            SK: encryptedSK,
+            GSI1PK: encryptedGSI1PK,
+            GSI1SK: encryptedGSI1SK,
+            GSI2PK: encryptedGSI2PK,
+            GSI2SK: encryptedGSI2SK,
+            fromUserId: encryptedFromUserId,
+            toUserId: encryptedToUserId,
+            notes: encryptedNotes,
+            reviewedBy: encryptedAdminId,
+            reviewedAt, // Timestamp remains unencrypted
         };
 
         console.log("DynamoDB Item to Insert:", JSON.stringify(item, null, 2));
 
-        // Insert into DynamoDB
         try {
             await dynamoDB.put({ TableName: TABLE_NAME, Item: item }).promise();
             console.log("DynamoDB Inserted Successfully");
@@ -65,41 +86,52 @@ exports.handler = async (event) => {
             };
         }
 
-        // Send Message to SQS if Queue URL is set
         if (QUEUE_URL) {
             try {
-                console.log("Attempting to send message to SQS...");
+                console.log("Sending message to SQS...");
                 await sqs.sendMessage({
                     QueueUrl: QUEUE_URL,
-                    MessageBody: JSON.stringify({ id, fromUserId, toUserId, notes, adminId, action: "review_details" }),
+                    MessageBody: JSON.stringify({
+                        id: encryptedId,
+                        fromUserId: encryptedFromUserId,
+                        toUserId: encryptedToUserId,
+                        notes: encryptedNotes,
+                        adminId: encryptedAdminId,
+                        action: "review_details",
+                    }),
                 }).promise();
-                console.log("SQS Message Sent:", id);
+                console.log("SQS Message Sent");
             } catch (sqsError) {
                 console.error("SQS Message Send Failed:", JSON.stringify(sqsError, null, 2));
             }
         }
 
-        // Trigger EventBridge Event
         try {
-            console.log("Attempting to send event to EventBridge...");
+            console.log("Sending event to EventBridge...");
             await eventBridge.putEvents({
                 Entries: [
                     {
                         Source: "messages.service",
                         DetailType: "DetailEvent",
-                        Detail: JSON.stringify({ id, fromUserId, toUserId, notes, adminId }),
+                        Detail: JSON.stringify({
+                            id: encryptedId,
+                            fromUserId: encryptedFromUserId,
+                            toUserId: encryptedToUserId,
+                            notes: encryptedNotes,
+                            adminId: encryptedAdminId,
+                        }),
                         EventBusName: EVENT_BUS_NAME,
                     },
                 ],
             }).promise();
-            console.log("EventBridge Triggered:", id);
+            console.log("EventBridge Triggered");
         } catch (eventError) {
             console.error("EventBridge Event Failed:", JSON.stringify(eventError, null, 2));
         }
 
         return {
             statusCode: 200,
-            body: JSON.stringify({ message: "Message details review recorded", id }),
+            body: JSON.stringify({ message: "Message details review recorded", id: encryptedId }),
         };
     } catch (error) {
         console.error("Unexpected Error:", JSON.stringify(error, null, 2));

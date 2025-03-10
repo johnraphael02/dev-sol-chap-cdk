@@ -6,7 +6,7 @@ const sqs = new AWS.SQS();
 
 const TABLE_NAME = process.env.MESSAGES_TABLE;
 const REVIEW_QUEUE_URL = process.env.REVIEW_QUEUE_URL;
-const decryptionFunction = "aes-decryption";
+const decryptionFunction = "sol-chap-decryption";
 
 exports.handler = async (event) => {
   try {
