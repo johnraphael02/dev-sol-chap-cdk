@@ -1,18 +1,16 @@
-const AWS = require('aws-sdk');
-
+const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
-const encryptionFunction = "aes-encryption";
 
-const BIDS_TABLE = process.env.BIDS_TABLE; // DynamoDB Table
-const BID_QUEUE_URL = process.env.BID_QUEUE_URL; // SQS Queue
+const encryptionFunction = "sol-chap-encryption";
+const BIDS_TABLE = process.env.BIDS_TABLE;
+const BID_QUEUE_URL = process.env.BID_QUEUE_URL;
 
 exports.handler = async (event) => {
     try {
         console.log("Received event:", JSON.stringify(event, null, 2));
-
         const auctionId = event.pathParameters.id;
 
         let body;
@@ -31,16 +29,16 @@ exports.handler = async (event) => {
 
         const timestamp = new Date().toISOString();
 
-        // Encrypt fields
+        // Encrypt data using the encryption function
         const encryptionResponse = await lambda.invoke({
             FunctionName: encryptionFunction,
             Payload: JSON.stringify({
-                data: { bidId, auctionId, bidAmount, userId }
+                body: JSON.stringify({ bidId, auctionId, bidAmount, userId })
             })
         }).promise();
 
         const encryptionResult = JSON.parse(encryptionResponse.Payload);
-        const encryptedData = JSON.parse(encryptionResult.body).encryptedData?.data;
+        const encryptedData = JSON.parse(encryptionResult.body).encryptedData;
 
         if (!encryptedData) {
             throw new Error("Encryption failed");
