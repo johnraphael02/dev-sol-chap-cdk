@@ -4,12 +4,16 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
 
 const MARKETPLACE_TABLE = process.env.MARKETPLACE_TABLE;
-const DECRYPTION_LAMBDA_NAME = process.env.DECRYPTION_LAMBDA_NAME;
+const DECRYPTION_LAMBDA_NAME = process.env.DECRYPTION_LAMBDA_NAME || "sol-chap-decryption";
 
 exports.handler = async (event) => {
   try {
+    console.log("🔍 Fetching encrypted Marketplace items...");
+    
     const result = await dynamodb.scan({ TableName: MARKETPLACE_TABLE }).promise();
     const encryptedItems = result.Items || [];
+
+    console.log("🔒 Retrieved Encrypted Items:", JSON.stringify(encryptedItems, null, 2));
 
     const decryptField = async (fieldName, encryptedValue) => {
       if (!encryptedValue) return encryptedValue;
@@ -17,16 +21,25 @@ exports.handler = async (event) => {
       try {
         const params = {
           FunctionName: DECRYPTION_LAMBDA_NAME,
-          Payload: JSON.stringify({ [fieldName]: encryptedValue }),
+          InvocationType: "RequestResponse",
+          Payload: JSON.stringify({ body: JSON.stringify({ [fieldName]: encryptedValue }) }),
         };
 
-        const response = await lambda.invoke(params).promise();
-        const parsedPayload = JSON.parse(response.Payload || "{}");
-        const body = parsedPayload.body ? JSON.parse(parsedPayload.body) : {};
-        const decryptedData = body.decryptedData || {};
-        const decryptedValue = decryptedData[fieldName];
+        console.log(`📩 Sending ${fieldName} to Decryption Lambda:`, params);
 
-        return decryptedValue || encryptedValue;
+        const response = await lambda.invoke(params).promise();
+        console.log("📩 Raw Decryption Response:", JSON.stringify(response, null, 2));
+
+        const parsedPayload = JSON.parse(response.Payload || "{}");
+        console.log("📩 Parsed Payload:", parsedPayload);
+
+        const body = parsedPayload.body ? JSON.parse(parsedPayload.body) : {};
+        console.log("📩 Parsed Body:", body);
+
+        const decryptedData = body.decryptedData || {};
+        console.log("🔑 Decrypted Data:", decryptedData);
+
+        return decryptedData[fieldName] || encryptedValue;
       } catch (err) {
         console.error(`❌ Error decrypting ${fieldName}:`, err.message);
         return encryptedValue;
@@ -45,6 +58,8 @@ exports.handler = async (event) => {
         };
       })
     );
+
+    console.log("✅ Final Decrypted Marketplace Items:", JSON.stringify(decryptedItems, null, 2));
 
     return {
       statusCode: 200,
