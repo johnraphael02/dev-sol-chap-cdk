@@ -14,13 +14,23 @@ const ENCRYPTION_FUNCTION = "sol-chap-encryption"; // Encryption Lambda function
  * Calls the encryption Lambda function
  */
 async function encryptData(data) {
-    const params = {
-        FunctionName: ENCRYPTION_FUNCTION,
-        Payload: JSON.stringify({ data }),
-    };
-    const response = await lambda.invoke(params).promise();
-    const encryptedData = JSON.parse(response.Payload);
-    return encryptedData.encrypted;
+    try {
+        const params = {
+            FunctionName: ENCRYPTION_FUNCTION,
+            Payload: JSON.stringify({ data }),
+        };
+        const response = await lambda.invoke(params).promise();
+        const encryptedData = JSON.parse(response.Payload);
+
+        if (!encryptedData || !encryptedData.encrypted) {
+            throw new Error(`Encryption failed for data: ${data}`);
+        }
+
+        return encryptedData.encrypted;
+    } catch (error) {
+        console.error("Encryption Lambda Error:", error);
+        throw new Error(`Encryption failed: ${error.message}`);
+    }
 }
 
 exports.handler = async (event) => {
@@ -45,14 +55,22 @@ exports.handler = async (event) => {
         }
 
         console.log("Encrypting all data...");
-        const encryptedFilterId = await encryptData(filterId);
-        const encryptedName = await encryptData(name);
-        const encryptedPattern = await encryptData(pattern);
-        const encryptedAction = await encryptData(action);
-        const encryptedEnabled = await encryptData(enabled.toString());
-        const encryptedMetadata = await encryptData(JSON.stringify(metadata));
-        const encryptedPK = await encryptData(`FILTER#${filterId}`);
-        const encryptedSK = await encryptData("METADATA");
+        const [encryptedFilterId, encryptedName, encryptedPattern, encryptedAction, encryptedEnabled, encryptedMetadata, encryptedPK, encryptedSK] = await Promise.all([
+            encryptData(filterId),
+            encryptData(name),
+            encryptData(pattern),
+            encryptData(action),
+            encryptData(enabled.toString()),
+            encryptData(JSON.stringify(metadata)),
+            encryptData(`FILTER#${filterId}`),
+            encryptData("METADATA"),
+        ]);
+
+        // Ensure required fields are encrypted correctly
+        if (!encryptedPK || !encryptedSK) {
+            console.error("Encryption failed: Missing PK or SK.");
+            return { statusCode: 500, body: JSON.stringify({ message: "Encryption failed. PK/SK is missing." }) };
+        }
 
         const createdAt = new Date().getTime();
         const updatedAt = new Date().getTime();
@@ -72,6 +90,7 @@ exports.handler = async (event) => {
 
         console.log("DynamoDB Item to Insert:", JSON.stringify(updatedFilter, null, 2));
 
+        // Insert into DynamoDB
         try {
             await dynamoDB.put({ TableName: MESSAGE_FILTERS_TABLE, Item: updatedFilter }).promise();
             console.log("DynamoDB Inserted Successfully");
@@ -83,6 +102,7 @@ exports.handler = async (event) => {
             };
         }
 
+        // Send to SQS (if available)
         if (QUEUE_URL) {
             try {
                 console.log("Sending message to SQS...");
@@ -100,6 +120,7 @@ exports.handler = async (event) => {
             }
         }
 
+        // Trigger EventBridge
         try {
             console.log("Sending event to EventBridge...");
             await eventBridge.putEvents({
