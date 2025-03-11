@@ -1,29 +1,26 @@
 const AWS = require("aws-sdk");
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 
-// AWS Services
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
-const lambda = new AWS.Lambda();
 
-// Environment Variables
 const USERS_TABLE = "Dev-Users";
 const SQS_QUEUE_URL = "https://sqs.ap-southeast-2.amazonaws.com/066926217034/Dev-UserQueue";
-const EMAIL_INDEX = "Dev-EmailIndex"; // GSI for email lookup
-const ENCRYPTION_LAMBDA = "sol-chap-encryption"; // Lambda function name
+const EMAIL_INDEX = "Dev-EmailIndex";
 
-// Function to invoke encryption Lambda
-const encryptField = async (fieldValue) => {
-    const payload = JSON.stringify({ text: fieldValue });
+// AES Encryption Configuration
+const secret_key = process.env.AES_SECRET_KEY;
+const secret_iv = process.env.AES_SECRET_IV;
+const encryption_method = process.env.AES_ENCRYPTION_METHOD;
 
-    const response = await lambda.invoke({
-        FunctionName: ENCRYPTION_LAMBDA,
-        Payload: payload,
-    }).promise();
+const key = crypto.createHash("sha512").update(secret_key).digest("hex").substring(0, 32);
+const encryptionIV = crypto.createHash("sha512").update(secret_iv).digest("hex").substring(0, 16);
 
-    const encryptedData = JSON.parse(response.Payload);
-    return encryptedData.encryptedText;
-};
+function encryptData(data) {
+    const cipher = crypto.createCipheriv(encryption_method, key, encryptionIV);
+    return Buffer.from(cipher.update(data, "utf8", "hex") + cipher.final("hex")).toString("base64");
+}
 
 exports.handler = async (event) => {
     try {
@@ -41,27 +38,13 @@ exports.handler = async (event) => {
             };
         }
 
-        // 📌 Encrypt all fields (including PK & SK)
-        const encryptedId = await encryptField(id);
-        const encryptedEmail = await encryptField(email);
-        const encryptedUsername = await encryptField(username);
-        const encryptedMembershipTier = await encryptField(membershipTier);
-        
-        // Hash and encrypt password
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const encryptedPassword = await encryptField(hashedPassword);
-
-        // Encrypt PK & SK
-        const encryptedPK = await encryptField(`USER#${id}`);
-        const encryptedSK = await encryptField("METADATA");
-
-        // 📌 Check if encrypted user already exists (using encrypted email)
+        // 📌 Check if user already exists by email using GSI (EmailIndex)
         const existingUser = await dynamoDB.query({
             TableName: USERS_TABLE,
             IndexName: EMAIL_INDEX,
             KeyConditionExpression: "GSI1PK = :emailKey",
             ExpressionAttributeValues: {
-                ":emailKey": `EMAIL#${encryptedEmail}`,
+                ":emailKey": `EMAIL#${email}`,
             },
         }).promise();
 
@@ -73,32 +56,35 @@ exports.handler = async (event) => {
             };
         }
 
-        // 📌 Store encrypted user data in DynamoDB
-        const newUser = {
-            PK: encryptedPK, // Encrypted Partition Key
-            SK: encryptedSK, // Encrypted Sort Key
-            GSI1PK: `EMAIL#${encryptedEmail}`, // Encrypted Email for lookup
-            GSI1SK: encryptedPK, // Encrypted ID for lookup
-            email: encryptedEmail,
-            username: encryptedUsername,
-            password: encryptedPassword,
-            membershipTier: encryptedMembershipTier,
-            created_at: new Date().toISOString(), // Timestamp remains unencrypted
+        // 📌 Hash the password before encrypting
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        // 📌 Encrypt user data
+        const encryptedUser = {
+            PK: encryptData(`USER#${id}`),
+            SK: encryptData("METADATA"),
+            GSI1PK: encryptData(`EMAIL#${email}`),
+            GSI1SK: encryptData(`USER#${id}`),
+            email: encryptData(email),
+            username: encryptData(username),
+            password: encryptData(hashedPassword),
+            membershipTier: encryptData(membershipTier),
+            created_at: encryptData(new Date().toISOString()),
         };
 
         await dynamoDB.put({
             TableName: USERS_TABLE,
-            Item: newUser,
+            Item: encryptedUser,
         }).promise();
 
-        console.log("✅ User registered successfully (encrypted via Lambda):", newUser);
+        console.log("✅ User registered successfully:", encryptedUser);
 
-        // 📌 Send encrypted data to SQS
+        // 📌 Send a message to SQS for further processing (without password for security)
         const sqsMessage = {
-            id: encryptedId,
-            email: encryptedEmail,
-            username: encryptedUsername,
-            membershipTier: encryptedMembershipTier,
+            id: encryptData(id),
+            email: encryptData(email),
+            username: encryptData(username),
+            membershipTier: encryptData(membershipTier),
             eventType: "UserCreateEvent",
         };
 
@@ -107,13 +93,12 @@ exports.handler = async (event) => {
             MessageBody: JSON.stringify(sqsMessage),
         }).promise();
 
-        console.log("📨 User registration event sent to SQS (encrypted via Lambda):", sqsMessage);
+        console.log("📨 User registration event sent to SQS:", sqsMessage);
 
         return {
             statusCode: 201,
-            body: JSON.stringify({ message: "User registered successfully (encrypted via Lambda)" }),
+            body: JSON.stringify({ message: "User registered successfully" }),
         };
-
     } catch (error) {
         console.error("❌ Error registering user:", error);
         return {

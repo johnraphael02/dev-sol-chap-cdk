@@ -62,12 +62,11 @@ exports.handler = async (event) => {
     // Step 1: Scan messages with status === "PENDING"
     const scanParams = {
       TableName: TABLE_NAME,
-      FilterExpression: "begins_with(PK, :prefix) AND #status = :pendingStatus",
+      FilterExpression: "#status = :pendingStatus",
       ExpressionAttributeNames: {
         "#status": "status", // 'status' is a reserved word in DynamoDB
       },
       ExpressionAttributeValues: {
-        ":prefix": "MESSAGE#",
         ":pendingStatus": "PENDING",
       },
     };
