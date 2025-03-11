@@ -6,7 +6,7 @@ const sqs = new AWS.SQS();
 const lambda = new AWS.Lambda();
 
 const USERS_TABLE = "Dev-Users";
-const SQS_QUEUE_URL = "https://sqs.ap-southeast-2.amazonaws.com/066926217034/UserQueue";
+const USER_QUEUE_URL = process.env.USER_QUEUE_URL;
 const EMAIL_INDEX = "Dev-EmailIndex";
 const ENCRYPTION_LAMBDA = "sol-chap-encryption";
 
@@ -117,7 +117,7 @@ exports.handler = async (event) => {
     };
 
     await sqs.sendMessage({
-      QueueUrl: SQS_QUEUE_URL,
+      QueueUrl: USER_QUEUE_URL,
       MessageBody: JSON.stringify(sqsMessage),
     }).promise();
 
