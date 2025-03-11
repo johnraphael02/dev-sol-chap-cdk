@@ -1,99 +1,129 @@
 const AWS = require("aws-sdk");
-const bcrypt = require("bcryptjs");
 
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
+const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
 
-const USERS_TABLE = "Users";
-const SQS_QUEUE_URL = "https://sqs.ap-southeast-2.amazonaws.com/066926217034/UserQueue";
-const EMAIL_INDEX = "EmailIndex";
-const ENCRYPTION_FUNCTION = process.env.ENCRYPTION_FUNCTION || "sol-chap-encryption";
+// Use environment variable for encryption function name (default to "aes-encryption")
+const encryptionFunction = process.env.ENCRYPTION_FUNCTION || "sol-chap-encryption";
+const USERS_TABLE = process.env.USERS_TABLE; // DynamoDB Users Table
+const MEMBERSHIP_QUEUE_URL = process.env.MEMBERSHIP_QUEUE_URL; // SQS Queue
 
 exports.handler = async (event) => {
     try {
-        console.log("📌 Received register request:", event.body);
+        console.log("Received event:", JSON.stringify(event, null, 2));
 
-        const requestBody = JSON.parse(event.body);
-        const { id, email, password, username, membershipTier } = requestBody;
-
-        if (!id || !email || !password || !username || !membershipTier) {
-            console.warn("⚠️ Missing required fields:", requestBody);
-            return { statusCode: 400, body: JSON.stringify({ error: "Missing required fields" }) };
+        let body;
+        try {
+            body = JSON.parse(event.body);
+        } catch (parseError) {
+            console.error("Invalid JSON format:", parseError);
+            return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON format" }) };
         }
 
-        // Check if user already exists
-        const existingUser = await dynamoDB.query({
-            TableName: USERS_TABLE,
-            IndexName: EMAIL_INDEX,
-            KeyConditionExpression: "GSI1PK = :emailKey",
-            ExpressionAttributeValues: { ":emailKey": `EMAIL#${email}` },
-        }).promise();
+        const { userId, membershipLevel, email } = body;
 
-        if (existingUser.Items.length > 0) {
-            console.warn("⚠️ User with this email already exists:", email);
-            return { statusCode: 400, body: JSON.stringify({ error: "Email already exists" }) };
+        if (!userId || !membershipLevel || !email) {
+            return { statusCode: 400, body: JSON.stringify({ error: "Missing required fields (userId, membershipLevel, email)" }) };
         }
 
-        // Hash password
-        const hashedPassword = await bcrypt.hash(password, 10);
+        const timestamp = new Date().toISOString();
 
-        // Encrypt user data
+        // Invoke the encryption Lambda to encrypt userId, membershipLevel, email, and SK
         const encryptionResponse = await lambda.invoke({
-            FunctionName: ENCRYPTION_FUNCTION,
+            FunctionName: encryptionFunction,
             InvocationType: "RequestResponse",
             Payload: JSON.stringify({
-                data: {
-                    id,
-                    email,
-                    username,
-                    membershipTier,
-                    SK: "METADATA"
+                data: { 
+                    userId, 
+                    membershipLevel, 
+                    email, 
+                    SK: "MEMBERSHIP" // Include SK in the encryption request
                 }
             })
         }).promise();
 
-        console.log("🔒 Encryption Lambda response:", encryptionResponse);
+        console.log("Encryption Lambda response:", encryptionResponse);
 
         const encryptionResult = JSON.parse(encryptionResponse.Payload);
+        console.log("Parsed encryption result:", encryptionResult);
+
         const parsedEncryptionBody = JSON.parse(encryptionResult.body);
         const encryptedData = parsedEncryptionBody.encryptedData;
 
-        if (!encryptedData || !encryptedData.id || !encryptedData.email || !encryptedData.username || !encryptedData.SK) {
+        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipLevel || !encryptedData.email || !encryptedData.SK) {
             throw new Error("Encryption failed: missing encrypted data");
         }
 
-        // Store encrypted user in DynamoDB
-        const newUser = {
-            PK: `USER#${encryptedData.id}`,
-            SK: encryptedData.SK,
-            GSI1PK: `EMAIL#${encryptedData.email}`,
-            GSI1SK: `USER#${encryptedData.id}`,
-            email: encryptedData.email,
-            username: encryptedData.username,
-            password: hashedPassword, // Keep password hashed
-            membershipTier: encryptedData.membershipTier,
-            createdAt: new Date().toISOString(),
-        };
+        // Store Membership Upgrade in DynamoDB
+        try {
+            console.log("Storing membership upgrade in DynamoDB...");
+            await dynamoDB.put({
+                TableName: USERS_TABLE,
+                Item: {
+                    PK: `USER#${encryptedData.userId}`,
+                    SK: encryptedData.SK, // Encrypted SK
+                    membershipTier: encryptedData.membershipLevel,
+                    createdAt: timestamp,
+                    updated_at: timestamp,
+                    email: encryptedData.email,
+                    GSI1PK: `EMAIL#${encryptedData.email}`,
+                    GSI1SK: `USER#${encryptedData.userId}`,
+                },
+                ConditionExpression: "attribute_not_exists(PK)",
+            }).promise();
+            console.log("Membership upgrade stored in DynamoDB");
+        } catch (dbError) {
+            console.error("DynamoDB Error:", dbError);
+            return { statusCode: 500, body: JSON.stringify({ error: "DynamoDB Write Failed" }) };
+        }
 
-        await dynamoDB.put({ TableName: USERS_TABLE, Item: newUser }).promise();
-        console.log("✅ User registered successfully:", newUser);
+        // Send Membership Update to SQS Queue (if configured)
+        if (MEMBERSHIP_QUEUE_URL) {
+            try {
+                console.log("Sending membership update to SQS...");
+                await sqs.sendMessage({
+                    QueueUrl: MEMBERSHIP_QUEUE_URL,
+                    MessageBody: JSON.stringify({
+                        userId: encryptedData.userId,
+                        membershipLevel: encryptedData.membershipLevel,
+                        timestamp
+                    })
+                }).promise();
+                console.log("Membership update sent to SQS");
+            } catch (sqsError) {
+                console.error("SQS Error:", sqsError);
+                return { statusCode: 500, body: JSON.stringify({ error: "SQS Send Failed" }) };
+            }
+        } else {
+            console.warn("MEMBERSHIP_QUEUE_URL not configured");
+        }
 
-        // Send event to SQS (excluding password)
-        const sqsMessage = {
-            id: encryptedData.id,
-            email: encryptedData.email,
-            username: encryptedData.username,
-            membershipTier: encryptedData.membershipTier,
-            eventType: "UserCreateEvent",
-        };
+        // Publish EventBridge event for the membership upgrade
+        try {
+            console.log("Triggering EventBridge...");
+            await eventBridge.putEvents({
+                Entries: [{
+                    Source: "aws.membership",
+                    DetailType: "UpgradeMembership",
+                    Detail: JSON.stringify({
+                        userId: encryptedData.userId,
+                        membershipLevel: encryptedData.membershipLevel,
+                        timestamp
+                    }),
+                    EventBusName: "default",
+                }],
+            }).promise();
+            console.log("Event sent to EventBridge");
+        } catch (eventBridgeError) {
+            console.error("EventBridge Error:", eventBridgeError);
+            return { statusCode: 500, body: JSON.stringify({ error: "EventBridge Trigger Failed" }) };
+        }
 
-        await sqs.sendMessage({ QueueUrl: SQS_QUEUE_URL, MessageBody: JSON.stringify(sqsMessage) }).promise();
-        console.log("📨 User registration event sent to SQS:", sqsMessage);
-
-        return { statusCode: 201, body: JSON.stringify({ message: "User registered successfully" }) };
+        return { statusCode: 201, body: JSON.stringify({ message: "Membership upgraded successfully" }) };
     } catch (error) {
-        console.error("❌ Error registering user:", error);
-        return { statusCode: 500, body: JSON.stringify({ error: "Could not register user", details: error.message }) };
+        console.error("Lambda Error:", error);
+        return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
     }
 };
