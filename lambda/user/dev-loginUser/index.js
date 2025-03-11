@@ -16,7 +16,7 @@ exports.handler = async (event) => {
 
     // Query the Users table using EmailIndex
     const params = {
-        TableName: "Users",
+        TableName: "Dev-Users",
         IndexName: "EmailIndex",
         KeyConditionExpression: "GSI1PK = :email AND begins_with(GSI1SK, :userPrefix)",
         ExpressionAttributeValues: {
@@ -53,7 +53,7 @@ exports.handler = async (event) => {
 
         // ✅ Step 1: Fetch all SK values related to the user
         const getAllSKParams = {
-            TableName: "Users",
+            TableName: "Dev-Users",
             KeyConditionExpression: "PK = :userPK",
             ExpressionAttributeValues: {
                 ":userPK": user.PK, // USER#2468
@@ -72,7 +72,7 @@ exports.handler = async (event) => {
         // ✅ Step 2: Update all existing SK rows to set event to LOGIN
         const updatePromises = allSKItems.Items.map(async (item) => {
             const updateParams = {
-                TableName: "Users",
+                TableName: "Dev-Users",
                 Key: {
                     PK: user.PK,
                     SK: item.SK,

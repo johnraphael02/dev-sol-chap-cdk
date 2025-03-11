@@ -1,4 +1,4 @@
-const AWS = require('aws-sdk');
+const AWS = require("aws-sdk");
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
 const sqs = new AWS.SQS();
@@ -6,32 +6,32 @@ const sqs = new AWS.SQS();
 const TABLE_NAME = process.env.MESSAGES_TABLE;
 const REVIEW_QUEUE_URL = process.env.REVIEW_QUEUE_URL;
 const DECRYPTION_LAMBDA = "sol-chap-decryption";
-const ENCRYPTION_LAMBDA = "sol-chap-encryption"; // Assumed encryption lambda name
+const ENCRYPTION_LAMBDA = "sol-chap-encryption"; // Make sure this is defined in your Lambda console/env
 
-// Helper: Encrypt a value using the encryption Lambda
-async function encryptValue(value) {
+// Encrypt SK value
+const encryptValue = async (value) => {
   try {
     const response = await lambda.invoke({
       FunctionName: ENCRYPTION_LAMBDA,
       InvocationType: "RequestResponse",
-      Payload: JSON.stringify({ body: JSON.stringify({ text: value }) })
+      Payload: JSON.stringify({ body: JSON.stringify({ text: value }) }),
     }).promise();
 
     const parsed = JSON.parse(response.Payload);
-    if (parsed.statusCode !== 200 || !parsed.body) throw new Error("Invalid encryption response");
-
     const encrypted = JSON.parse(parsed.body).encryptedData;
+
+    if (!encrypted) throw new Error("Missing encryptedData from encryption lambda");
     return encrypted;
   } catch (err) {
-    console.error("🔐 Encryption error:", err);
+    console.error("🔐 Encryption error:", err.message);
     throw err;
   }
-}
+};
 
-// Helper: Decrypt message fields using decryption Lambda
-async function decryptMessage(message) {
+// Decrypt the message fields
+const decryptMessage = async (message) => {
   try {
-    const decryptionResponse = await lambda.invoke({
+    const response = await lambda.invoke({
       FunctionName: DECRYPTION_LAMBDA,
       InvocationType: "RequestResponse",
       Payload: JSON.stringify({
@@ -45,10 +45,15 @@ async function decryptMessage(message) {
       }),
     }).promise();
 
-    const parsed = JSON.parse(decryptionResponse.Payload);
-    const decryptedData = JSON.parse(parsed.body).decryptedData;
+    const parsed = JSON.parse(response.Payload);
+    if (parsed.statusCode !== 200 || !parsed.body) {
+      throw new Error("Invalid decryption lambda response");
+    }
 
-    if (!decryptedData) throw new Error("Missing decrypted data");
+    const decryptedData = JSON.parse(parsed.body).decryptedData;
+    if (!decryptedData) {
+      throw new Error("Missing decryptedData in decryption response");
+    }
 
     return {
       ...message,
@@ -60,61 +65,59 @@ async function decryptMessage(message) {
       GSI2PK: decryptedData.receiverId,
     };
   } catch (err) {
-    console.error("❌ Decryption failed:", err.message);
+    console.error("❌ Decryption error for message:", message.PK, err.message);
     return null;
   }
-}
+};
 
 exports.handler = async (event) => {
   try {
-    // Step 1: Encrypt 'STATUS#PENDING'
+    // Step 1: Encrypt the filter value for SK
     const encryptedStatus = await encryptValue("STATUS#PENDING");
-    console.log("🔐 Encrypted STATUS#PENDING:", encryptedStatus);
+    console.log("🔐 Encrypted SK for comparison:", encryptedStatus);
 
-    // Step 2: Scan all items starting with MESSAGE#
-    const params = {
+    // Step 2: Scan all MESSAGE# items from DynamoDB
+    const scanParams = {
       TableName: TABLE_NAME,
-      FilterExpression: "begins_with(PK, :pkPrefix)",
+      FilterExpression: "begins_with(PK, :prefix)",
       ExpressionAttributeValues: {
-        ":pkPrefix": "MESSAGE#"
-      }
+        ":prefix": "MESSAGE#",
+      },
     };
 
-    const data = await dynamoDB.scan(params).promise();
-    let messages = data.Items || [];
+    const scanResult = await dynamoDB.scan(scanParams).promise();
+    const allMessages = scanResult.Items || [];
+    console.log(`📦 Total messages retrieved: ${allMessages.length}`);
 
-    console.log(`📦 Retrieved ${messages.length} messages from DynamoDB`);
+    // Step 3: Filter records whose SK match the encrypted SK
+    const matchedMessages = allMessages.filter(item => item.SK === encryptedStatus);
+    console.log(`✅ Matched messages with encrypted SK: ${matchedMessages.length}`);
 
-    // Step 3: Filter messages where SK === encryptedStatus
-    const pendingMessages = messages.filter(msg => msg.SK === encryptedStatus);
-    console.log(`🟡 Filtered ${pendingMessages.length} PENDING encrypted messages`);
-
-    // Step 4: Decrypt each valid message
-    const decryptedMessages = [];
-    for (const msg of pendingMessages) {
+    // Step 4: Decrypt and push to SQS
+    for (const msg of matchedMessages) {
       const decrypted = await decryptMessage(msg);
-      if (decrypted) decryptedMessages.push(decrypted);
-    }
+      if (!decrypted) {
+        console.warn(`⚠️ Message ${msg.PK} skipped due to decryption failure.`);
+        continue;
+      }
 
-    // Step 5: Send each decrypted message to SQS
-    for (const message of decryptedMessages) {
       try {
         const sqsParams = {
           QueueUrl: REVIEW_QUEUE_URL,
-          MessageBody: JSON.stringify(message),
+          MessageBody: JSON.stringify(decrypted),
         };
         await sqs.sendMessage(sqsParams).promise();
-        console.log(`📤 Message ${message.PK} sent to SQS`);
+        console.log(`📤 Message ${msg.PK} sent to SQS`);
       } catch (sqsErr) {
-        console.error(`❌ Failed to send message ${message.PK} to SQS:`, sqsErr);
+        console.error(`❌ Failed to send message ${msg.PK} to SQS:`, sqsErr.message);
       }
     }
 
     return {
       statusCode: 200,
       body: JSON.stringify({
-        message: "Encrypted SK filter applied. Messages decrypted and sent to SQS.",
-        count: decryptedMessages.length,
+        message: "Pending messages (by encrypted SK) decrypted and pushed to SQS successfully.",
+        count: matchedMessages.length,
       }),
     };
   } catch (err) {

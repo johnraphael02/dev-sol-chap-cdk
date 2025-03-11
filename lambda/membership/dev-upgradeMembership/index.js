@@ -30,12 +30,17 @@ exports.handler = async (event) => {
 
         const timestamp = new Date().toISOString();
 
-        // Invoke the encryption Lambda to encrypt userId, membershipLevel, and email
+        // Invoke the encryption Lambda to encrypt userId, membershipLevel, email, and SK
         const encryptionResponse = await lambda.invoke({
             FunctionName: encryptionFunction,
             InvocationType: "RequestResponse",
             Payload: JSON.stringify({
-                data: { userId, membershipLevel, email }
+                data: { 
+                    userId, 
+                    membershipLevel, 
+                    email, 
+                    SK: "MEMBERSHIP" // Include SK in the encryption request
+                }
             })
         }).promise();
 
@@ -47,7 +52,7 @@ exports.handler = async (event) => {
         const parsedEncryptionBody = JSON.parse(encryptionResult.body);
         const encryptedData = parsedEncryptionBody.encryptedData;
 
-        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipLevel || !encryptedData.email) {
+        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipLevel || !encryptedData.email || !encryptedData.SK) {
             throw new Error("Encryption failed: missing encrypted data");
         }
 
@@ -58,7 +63,7 @@ exports.handler = async (event) => {
                 TableName: USERS_TABLE,
                 Item: {
                     PK: `USER#${encryptedData.userId}`,
-                    SK: `MEMBERSHIP`,
+                    SK: encryptedData.SK, // Encrypted SK
                     membership_status: encryptedData.membershipLevel,
                     created_at: timestamp,
                     updated_at: timestamp,

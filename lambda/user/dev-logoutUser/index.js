@@ -5,7 +5,7 @@ const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 
 // Environment variables
-const TABLE_NAME = process.env.USERS_TABLE_NAME || "Users";
+const TABLE_NAME = process.env.USERS_TABLE_NAME || "Dev-Users";
 const QUEUE_URL = process.env.AUTH_QUEUE_URL; // SQS Queue
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default"; // EventBridge Rule
 
