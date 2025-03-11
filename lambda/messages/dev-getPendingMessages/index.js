@@ -16,7 +16,7 @@ exports.handler = async (event) => {
       FilterExpression: "begins_with(PK, :messagePrefix) AND SK = :pending",
       ExpressionAttributeValues: {
         ":messagePrefix": "MESSAGE#",
-        ":pending": "STATUS#PENDING",
+        ":pending": "PENDING",
       },
     };
 
