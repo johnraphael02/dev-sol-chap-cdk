@@ -19,8 +19,16 @@ async function encryptData(data) {
         Payload: JSON.stringify({ data }),
     };
     const response = await lambda.invoke(params).promise();
-    const encryptedData = JSON.parse(response.Payload);
-    return encryptedData.encrypted;
+    
+    // Fix: Ensure Payload is parsed properly
+    try {
+        const encryptedData = JSON.parse(response.Payload);
+        if (!encryptedData.encrypted) throw new Error("Encryption function returned invalid data");
+        return encryptedData.encrypted;
+    } catch (error) {
+        console.error("Encryption Error:", error);
+        throw new Error("Failed to encrypt data");
+    }
 }
 
 exports.handler = async (event) => {
@@ -58,6 +66,15 @@ exports.handler = async (event) => {
         const encryptedGSI2SK = await encryptData(`CREATED_AT`);
 
         const reviewedAt = new Date().toISOString();
+
+        // Fix: Ensure PK is not undefined before inserting
+        if (!encryptedPK || !encryptedSK) {
+            console.error("Error: Missing PK or SK after encryption.");
+            return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "PK or SK encryption failed" }),
+            };
+        }
 
         const item = {
             PK: encryptedPK,

@@ -1,137 +1,88 @@
-const AWS = require("aws-sdk");
-
+const AWS = require('aws-sdk');
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
-const lambda = new AWS.Lambda();
 
-const MESSAGE_FILTERS_TABLE = process.env.MESSAGE_FILTERS_TABLE || "Dev-MessageFilters";
-const QUEUE_URL = process.env.QUEUE_URL;
-const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
-const ENCRYPTION_FUNCTION = "sol-chap-encryption"; // Encryption Lambda function
-
-/**
- * Calls the encryption Lambda function
- */
-async function encryptData(data) {
-    const params = {
-        FunctionName: ENCRYPTION_FUNCTION,
-        Payload: JSON.stringify({ data }),
-    };
-    const response = await lambda.invoke(params).promise();
-    const encryptedData = JSON.parse(response.Payload);
-    return encryptedData.encrypted;
-}
+const MESSAGE_FILTERS_TABLE = process.env.MESSAGE_FILTERS_TABLE;
+const QUEUE_URL = process.env.QUEUE_URL; // SQS Queue URL
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || 'default'; // EventBus Name
 
 exports.handler = async (event) => {
     try {
-        console.log("Received event:", JSON.stringify(event, null, 2));
+        const requestBody = JSON.parse(event.body);
+        const filterId = requestBody.filterId;
+        const { name, pattern, action, enabled, metadata } = requestBody;
 
-        let requestBody;
-        try {
-            requestBody = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
-        } catch (parseError) {
-            console.error("JSON Parse Error:", parseError);
-            return { statusCode: 400, body: JSON.stringify({ message: "Invalid JSON format" }) };
-        }
-
-        console.log("Parsed request body:", requestBody);
-
-        const { filterId, name, pattern, action, enabled, metadata } = requestBody;
-
+        // Validate input fields
         if (!filterId || !name || !pattern || !action || enabled === undefined || !metadata) {
-            console.error("Error: Missing required fields.");
-            return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: filterId, name, pattern, action, enabled, metadata" }) };
-        }
-
-        console.log("Encrypting all data...");
-        const encryptedFilterId = await encryptData(filterId);
-        const encryptedName = await encryptData(name);
-        const encryptedPattern = await encryptData(pattern);
-        const encryptedAction = await encryptData(action);
-        const encryptedEnabled = await encryptData(enabled.toString());
-        const encryptedMetadata = await encryptData(JSON.stringify(metadata));
-        const encryptedPK = await encryptData(`FILTER#${filterId}`);
-        const encryptedSK = await encryptData("METADATA");
-
-        const createdAt = new Date().getTime();
-        const updatedAt = new Date().getTime();
-
-        const updatedFilter = {
-            PK: encryptedPK,
-            SK: encryptedSK,
-            filterId: encryptedFilterId,
-            name: encryptedName,
-            pattern: encryptedPattern,
-            action: encryptedAction,
-            enabled: encryptedEnabled,
-            createdAt,
-            updatedAt,
-            metadata: encryptedMetadata,
-        };
-
-        console.log("DynamoDB Item to Insert:", JSON.stringify(updatedFilter, null, 2));
-
-        try {
-            await dynamoDB.put({ TableName: MESSAGE_FILTERS_TABLE, Item: updatedFilter }).promise();
-            console.log("DynamoDB Inserted Successfully");
-        } catch (dbError) {
-            console.error("DynamoDB Insert Failed:", JSON.stringify(dbError, null, 2));
             return {
-                statusCode: 500,
-                body: JSON.stringify({ message: "DynamoDB Insert Failed", error: dbError.message }),
+                statusCode: 400,
+                body: JSON.stringify({ message: "Missing required fields: filterId, name, pattern, action, enabled, metadata" }),
             };
         }
 
-        if (QUEUE_URL) {
-            try {
-                console.log("Sending message to SQS...");
-                await sqs.sendMessage({
-                    QueueUrl: QUEUE_URL,
-                    MessageBody: JSON.stringify({
-                        eventType: "UPDATE_MESSAGE_FILTER",
-                        filterId: encryptedFilterId,
+        // Define the MessageFilter structure
+        const updatedFilter = {
+            PK: `FILTER#${filterId}`,
+            SK: 'METADATA',
+            filterId: filterId,
+            name: name,
+            pattern: pattern,
+            action: action,  // BLOCK, FLAG, or MODIFY
+            enabled: enabled,
+            createdAt: new Date().getTime(),
+            updatedAt: new Date().getTime(),
+            metadata: metadata
+        };
+
+        const params = {
+            TableName: MESSAGE_FILTERS_TABLE,
+            Item: updatedFilter,
+        };
+
+        // Update filter data in DynamoDB
+        await dynamoDB.put(params).promise();
+
+        // Send message to SQS Queue
+        const sqsMessage = {
+            QueueUrl: QUEUE_URL,
+            MessageBody: JSON.stringify({
+                eventType: "UPDATE_MESSAGE_FILTER",
+                filterId: filterId,
+                filterData: updatedFilter,
+            }),
+        };
+        await sqs.sendMessage(sqsMessage).promise();
+
+        // Trigger EventBridge Event
+        const eventParams = {
+            Entries: [
+                {
+                    EventBusName: EVENT_BUS_NAME,
+                    Source: "custom.filter.service",
+                    DetailType: "MessageFilterUpdated",
+                    Detail: JSON.stringify({
+                        filterId: filterId,
                         filterData: updatedFilter,
                     }),
-                }).promise();
-                console.log("SQS Message Sent");
-            } catch (sqsError) {
-                console.error("SQS Message Send Failed:", JSON.stringify(sqsError, null, 2));
-            }
-        }
-
-        try {
-            console.log("Sending event to EventBridge...");
-            await eventBridge.putEvents({
-                Entries: [
-                    {
-                        EventBusName: EVENT_BUS_NAME,
-                        Source: "custom.filter.service",
-                        DetailType: "MessageFilterUpdated",
-                        Detail: JSON.stringify({
-                            filterId: encryptedFilterId,
-                            filterData: updatedFilter,
-                        }),
-                    },
-                ],
-            }).promise();
-            console.log("EventBridge Triggered");
-        } catch (eventError) {
-            console.error("EventBridge Event Failed:", JSON.stringify(eventError, null, 2));
-        }
+                },
+            ],
+        };
+        await eventBridge.putEvents(eventParams).promise();
 
         return {
             statusCode: 200,
             body: JSON.stringify({
                 message: "Filter updated successfully",
-                filterId: encryptedFilterId,
+                filterId: filterId,
             }),
         };
     } catch (error) {
-        console.error("Unexpected Error:", JSON.stringify(error, null, 2));
+        console.error("Error updating filter:", error);
+
         return {
             statusCode: 500,
-            body: JSON.stringify({ error: error.message }),
+            body: JSON.stringify({ message: "Failed to update filter", error: error.message }),
         };
     }
 };
