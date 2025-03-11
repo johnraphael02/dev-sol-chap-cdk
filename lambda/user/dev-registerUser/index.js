@@ -1,26 +1,14 @@
 const AWS = require("aws-sdk");
 const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
+const axios = require("axios");
 
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 
 const USERS_TABLE = "Dev-Users";
 const SQS_QUEUE_URL = "https://sqs.ap-southeast-2.amazonaws.com/066926217034/Dev-UserQueue";
-const EMAIL_INDEX = "Dev-EmailIndex";
-
-// AES Encryption Configuration
-const secret_key = process.env.AES_SECRET_KEY;
-const secret_iv = process.env.AES_SECRET_IV;
-const encryption_method = process.env.AES_ENCRYPTION_METHOD;
-
-const key = crypto.createHash("sha512").update(secret_key).digest("hex").substring(0, 32);
-const encryptionIV = crypto.createHash("sha512").update(secret_iv).digest("hex").substring(0, 16);
-
-function encryptData(data) {
-    const cipher = crypto.createCipheriv(encryption_method, key, encryptionIV);
-    return Buffer.from(cipher.update(data, "utf8", "hex") + cipher.final("hex")).toString("base64");
-}
+const EMAIL_INDEX = "Dev-EmailIndex"; // GSI for email lookup
+const ENCRYPTION_SERVICE_URL = "sol-chap-encryption"; // External encryption service
 
 exports.handler = async (event) => {
     try {
@@ -56,35 +44,51 @@ exports.handler = async (event) => {
             };
         }
 
-        // 📌 Hash the password before encrypting
+        // 📌 Hash the password before storing
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        // 📌 Encrypt user data
-        const encryptedUser = {
-            PK: encryptData(`USER#${id}`),
-            SK: encryptData("METADATA"),
-            GSI1PK: encryptData(`EMAIL#${email}`),
-            GSI1SK: encryptData(`USER#${id}`),
-            email: encryptData(email),
-            username: encryptData(username),
-            password: encryptData(hashedPassword),
-            membershipTier: encryptData(membershipTier),
-            created_at: encryptData(new Date().toISOString()),
+        // 📌 Encrypt user data including PK and SK using external service
+        const encryptionResponse = await axios.post(ENCRYPTION_SERVICE_URL, {
+            id,
+            email,
+            username,
+            membershipTier,
+            pk: `USER#${id}`,
+            sk: "METADATA"
+        });
+
+        if (encryptionResponse.status !== 200) {
+            throw new Error("Encryption service failed");
+        }
+
+        const encryptedData = encryptionResponse.data.encryptedData;
+
+        // 📌 Store encrypted user in DynamoDB
+        const newUser = {
+            PK: encryptedData.pk,  // Encrypted Partition Key
+            SK: encryptedData.sk,  // Encrypted Sort Key
+            GSI1PK: `EMAIL#${email}`, // Secondary Index for email lookup
+            GSI1SK: encryptedData.pk,
+            email: encryptedData.email,
+            username: encryptedData.username,
+            password: hashedPassword, // Store hashed password
+            membershipTier: encryptedData.membershipTier,
+            created_at: new Date().toISOString(),
         };
 
         await dynamoDB.put({
             TableName: USERS_TABLE,
-            Item: encryptedUser,
+            Item: newUser,
         }).promise();
 
-        console.log("✅ User registered successfully:", encryptedUser);
+        console.log("✅ User registered successfully:", newUser);
 
         // 📌 Send a message to SQS for further processing (without password for security)
         const sqsMessage = {
-            id: encryptData(id),
-            email: encryptData(email),
-            username: encryptData(username),
-            membershipTier: encryptData(membershipTier),
+            id,
+            email,
+            username,
+            membershipTier,
             eventType: "UserCreateEvent",
         };
 
@@ -99,6 +103,7 @@ exports.handler = async (event) => {
             statusCode: 201,
             body: JSON.stringify({ message: "User registered successfully" }),
         };
+
     } catch (error) {
         console.error("❌ Error registering user:", error);
         return {

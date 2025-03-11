@@ -1,4 +1,5 @@
 const AWS = require("aws-sdk");
+
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
 const sqs = new AWS.SQS();
@@ -22,6 +23,9 @@ const decryptMessage = async (message) => {
           message: message.message,
           subject: message.subject,
           policy: message.policy,
+          PK: message.PK,
+          SK: message.SK,
+          GSI1PK: message.GSI1PK
         }),
       }),
     }).promise();
@@ -40,15 +44,23 @@ const decryptMessage = async (message) => {
 
     console.log(`✅ Message ${message.PK} decrypted successfully`);
 
+    // Build final object with decrypted values + untouched metadata
     return {
-      ...message,
-      senderId: decryptedData.senderId,
-      receiverId: decryptedData.receiverId,
-      message: decryptedData.message,
       subject: decryptedData.subject,
       policy: decryptedData.policy,
+      message: decryptedData.message,
+      senderId: decryptedData.senderId,
+      receiverId: decryptedData.receiverId,
+      timestamp: message.timestamp,
+      status: message.status,
+      GSI1PK: decryptedData.GSI1PK,
+      GSI1SK: message.GSI1SK,
       GSI2PK: decryptedData.receiverId,
+      GSI2SK: message.GSI2SK,
+      PK: decryptedData.PK,
+      SK: decryptedData.SK
     };
+
   } catch (err) {
     console.error(`❌ Decryption failed for message ${message.PK}:`, err.message);
     return null;
@@ -64,7 +76,7 @@ exports.handler = async (event) => {
       TableName: TABLE_NAME,
       FilterExpression: "#status = :pendingStatus",
       ExpressionAttributeNames: {
-        "#status": "status", // 'status' is a reserved word in DynamoDB
+        "#status": "status",
       },
       ExpressionAttributeValues: {
         ":pendingStatus": "PENDING",
@@ -118,14 +130,17 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         message: "Pending messages decrypted and pushed to SQS successfully.",
         count: decryptedMessages.length,
-        data: decryptedMessages, // Return decrypted messages
+        data: decryptedMessages,
       }),
     };
   } catch (err) {
     console.error("🚨 Error processing messages:", err);
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: "Failed to process messages", details: err.message }),
+      body: JSON.stringify({
+        error: "Failed to process messages",
+        details: err.message,
+      }),
     };
   }
 };

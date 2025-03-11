@@ -12,6 +12,7 @@
   "dependencies": {
     "aws-cdk": "^2.1003.0",
     "aws-sdk": "^2.1692.0",
+    "axios": "^1.8.2",
     "bcryptjs": "^3.0.2"
   }
 }
