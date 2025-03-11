@@ -59,7 +59,7 @@ exports.handler = async (event) => {
       IndexName: EMAIL_INDEX,
       KeyConditionExpression: "GSI1PK = :emailKey",
       ExpressionAttributeValues: {
-        ":emailKey": `EMAIL#${email}`,
+        ":emailKey": email, // No "EMAIL#" prefix
       },
     }).promise();
 
@@ -75,13 +75,12 @@ exports.handler = async (event) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const timestamp = new Date().toISOString();
 
-    // 🔐 Encrypt all user fields
+    // 🔐 Encrypt all user fields except `GSI1PK`
     const encryptedValues = await encryptData({
       PK: `USER#${id}`,
       SK: "METADATA",
-      GSI1PK: `EMAIL#${email}`,
       GSI1SK: `USER#${id}`,
-      email,
+      email, // Keep plain for GSI1PK
       username,
       membershipTier,
     });
@@ -90,7 +89,7 @@ exports.handler = async (event) => {
     const newUser = {
       PK: encryptedValues.PK,
       SK: encryptedValues.SK,
-      GSI1PK: encryptedValues.GSI1PK,
+      GSI1PK: email, // Store plain email (NO encryption)
       GSI1SK: encryptedValues.GSI1SK,
       email: encryptedValues.email,
       username: encryptedValues.username,

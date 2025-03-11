@@ -1,138 +1,98 @@
 const AWS = require("aws-sdk");
 const bcrypt = require("bcryptjs");
-const { v4: uuidv4 } = require("uuid");
 
-const docClient = new AWS.DynamoDB.DocumentClient();
+const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
 
-// ENV variables
-const USERS_TABLE = process.env.USERS_TABLE || "Dev-Users";
-const EMAIL_INDEX = process.env.EMAIL_INDEX || "Dev-EmailIndex";
-const ENCRYPTION_LAMBDA = process.env.ENCRYPTION_LAMBDA || "sol-chap-encryption";
+const USERS_TABLE = "Dev-Users";
+const EMAIL_INDEX = "Dev-EmailIndex";
+const ENCRYPTION_LAMBDA = "sol-chap-encryption";
 
-// 🔐 Helper: Encrypt a value via Encryption Lambda
-const encryptField = async (value) => {
-  try {
-    const response = await lambda.invoke({
-      FunctionName: ENCRYPTION_LAMBDA,
-      InvocationType: "RequestResponse",
-      Payload: JSON.stringify({ body: JSON.stringify({ text: value }) }),
-    }).promise();
+// 🔐 Encrypt Data Using Lambda
+async function encryptData(data) {
+  const params = {
+    FunctionName: ENCRYPTION_LAMBDA,
+    Payload: JSON.stringify(data),
+  };
 
-    const parsed = JSON.parse(response.Payload);
-    const encrypted = JSON.parse(parsed.body).encryptedData;
+  const response = await lambda.invoke(params).promise();
+  const encryptedResponse = JSON.parse(response.Payload);
 
-    if (!encrypted) throw new Error("Missing encryptedData");
-    return encrypted;
-  } catch (err) {
-    console.error("🔐 Encryption error:", err.message);
-    throw err;
+  if (encryptedResponse.statusCode !== 200) {
+    throw new Error(`Encryption failed: ${encryptedResponse.body}`);
   }
-};
+
+  return JSON.parse(encryptedResponse.body).encryptedData;
+}
 
 exports.handler = async (event) => {
   try {
-    const { email, password } = JSON.parse(event.body || "{}");
+    console.log("📌 Received login request:", event.body);
+    const { email, password } = JSON.parse(event.body);
 
     if (!email || !password) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ message: "Email and password are required." }),
+        body: JSON.stringify({ error: "Email and password are required" }),
       };
     }
 
-    // 🔐 Step 1: Encrypt Email
-    const encryptedEmail = await encryptField(email);
-    const encryptedGSI1PK = `EMAIL#${encryptedEmail}`;
+    // ✅ Encrypt Email Before Querying
+    const encryptedEmail = await encryptData({ email });
+    console.log("🔑 Encrypted Email for Query:", encryptedEmail);
 
-    // 🔍 Step 2: Query user using encrypted email via GSI
-    const queryParams = {
+    // ✅ Query DynamoDB for User Using Encrypted Email
+    const userQuery = await dynamoDB.query({
       TableName: USERS_TABLE,
       IndexName: EMAIL_INDEX,
       KeyConditionExpression: "GSI1PK = :emailKey",
       ExpressionAttributeValues: {
-        ":emailKey": encryptedGSI1PK,
+        ":emailKey": `EMAIL#${encryptedEmail}`,
       },
-    };
+    }).promise();
 
-    const userQuery = await docClient.query(queryParams).promise();
-
-    if (!userQuery.Items || userQuery.Items.length === 0) {
+    if (userQuery.Items.length === 0) {
       return {
         statusCode: 404,
-        body: JSON.stringify({ message: "User not found." }),
+        body: JSON.stringify({ error: "User not found." }),
       };
     }
 
     const user = userQuery.Items[0];
 
-    // 🔐 Step 3: Compare Password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
+    // ✅ Verify Password
+    const passwordMatch = await bcrypt.compare(password, user.password);
+    if (!passwordMatch) {
       return {
         statusCode: 401,
-        body: JSON.stringify({ message: "Invalid credentials." }),
+        body: JSON.stringify({ error: "Invalid credentials." }),
       };
     }
 
-    // 🔐 Step 4: Encrypt event = LOGIN
-    const encryptedEvent = await encryptField("LOGIN");
-
-    // 🔐 Step 5: Create session info
-    const sessionId = uuidv4();
+    // ✅ Generate Session ID
+    const sessionId = require("uuid").v4();
     const timestamp = new Date().toISOString();
 
-    // 🔍 Step 6: Query all SKs for the user using encrypted PK
-    const getAllSKParams = {
+    // ✅ Update User with Session Info
+    await dynamoDB.update({
       TableName: USERS_TABLE,
-      KeyConditionExpression: "PK = :pk",
+      Key: { PK: user.PK, SK: user.SK },
+      UpdateExpression: "SET session_id = :session, session_created_at = :timestamp",
       ExpressionAttributeValues: {
-        ":pk": user.PK, // Already encrypted from record
+        ":session": sessionId,
+        ":timestamp": timestamp,
       },
-    };
-
-    const allSKItems = await docClient.query(getAllSKParams).promise();
-
-    // 🔐 Step 7: Update all items with session + encrypted LOGIN event
-    const updatePromises = allSKItems.Items.map((item) => {
-      const updateParams = {
-        TableName: USERS_TABLE,
-        Key: {
-          PK: item.PK,
-          SK: item.SK,
-        },
-        UpdateExpression: "SET #event = :event, session_id = :sessionId, session_created_at = :timestamp",
-        ExpressionAttributeNames: {
-          "#event": "event",
-        },
-        ExpressionAttributeValues: {
-          ":event": encryptedEvent,
-          ":sessionId": sessionId,
-          ":timestamp": timestamp,
-        },
-      };
-      return docClient.update(updateParams).promise();
-    });
-
-    await Promise.all(updatePromises);
+    }).promise();
 
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        message: "User authenticated successfully.",
-        user_id: user.PK,
-        session: sessionId,
-      }),
+      body: JSON.stringify({ message: "User authenticated successfully.", session: sessionId }),
     };
-  } catch (err) {
-    console.error("❌ Login Error:", err);
+  } catch (error) {
+    console.error("❌ Error during authentication:", error);
     return {
       statusCode: 500,
-      body: JSON.stringify({
-        message: "Internal server error.",
-        debug_message: err.message,
-        debug_stack: err.stack,
-      }),
+      body: JSON.stringify({ error: "Internal server error." }),
     };
   }
 };
