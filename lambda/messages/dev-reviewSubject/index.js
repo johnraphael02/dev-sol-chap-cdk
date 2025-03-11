@@ -12,13 +12,30 @@ const ENCRYPTION_FUNCTION = "sol-chap-encryption"; // Encryption Lambda function
  * Calls the encryption Lambda function
  */
 const encrypt = async (data) => {
-    const params = {
-        FunctionName: ENCRYPTION_FUNCTION,
-        Payload: JSON.stringify({ data }),
-    };
-    const response = await lambda.invoke(params).promise();
-    const encryptedData = JSON.parse(response.Payload);
-    return encryptedData.encrypted;
+    try {
+        if (!data || typeof data !== "string") {
+            console.error("Encryption Error: Invalid input data", data);
+            throw new Error("Invalid data for encryption");
+        }
+
+        const params = {
+            FunctionName: ENCRYPTION_FUNCTION,
+            Payload: JSON.stringify({ data }),
+        };
+
+        const response = await lambda.invoke(params).promise();
+        console.log("Encryption Lambda Response:", response);
+
+        const encryptedData = JSON.parse(response.Payload);
+        if (!encryptedData.encrypted) {
+            throw new Error("Encryption Lambda returned an invalid response");
+        }
+
+        return encryptedData.encrypted;
+    } catch (error) {
+        console.error("Encryption Error:", error);
+        throw new Error("Encryption failed");
+    }
 };
 
 /**
@@ -46,6 +63,12 @@ exports.handler = async (event) => {
         const encryptedPK = await encrypt(`MESSAGE#${messageId}`);
         const encryptedSK = await encrypt("SUBJECT");
 
+        // Ensure encrypted values are not undefined
+        if (!encryptedMessageId || !encryptedSubject || !encryptedPK || !encryptedSK) {
+            console.error("Encryption returned undefined values");
+            return sendResponse(500, { message: "Encryption failed. Please try again." });
+        }
+
         const params = {
             TableName: MESSAGES_TABLE,
             Key: { PK: encryptedPK, SK: encryptedSK },
@@ -59,6 +82,8 @@ exports.handler = async (event) => {
         };
 
         console.log("DynamoDB Update Params:", JSON.stringify(params, null, 2));
+
+        // Update DynamoDB
         const result = await dynamoDB.update(params).promise();
 
         console.log("Updated Subject:", JSON.stringify(result.Attributes, null, 2));

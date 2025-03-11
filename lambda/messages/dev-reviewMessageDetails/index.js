@@ -10,17 +10,12 @@ const QUEUE_URL = process.env.DETAIL_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
 const ENCRYPTION_FUNCTION = "sol-chap-encryption"; // Encryption Lambda function
 
-/**
- * Calls the encryption Lambda function
- */
 async function encryptData(data) {
     const params = {
         FunctionName: ENCRYPTION_FUNCTION,
         Payload: JSON.stringify({ data }),
     };
     const response = await lambda.invoke(params).promise();
-    
-    // Fix: Ensure Payload is parsed properly
     try {
         const encryptedData = JSON.parse(response.Payload);
         if (!encryptedData.encrypted) throw new Error("Encryption function returned invalid data");
@@ -46,7 +41,6 @@ exports.handler = async (event) => {
         console.log("Parsed request body:", body);
 
         const { id, fromUserId, toUserId, notes, adminId } = body;
-
         if (!id || !fromUserId || !toUserId || !notes || !adminId) {
             console.error("Error: Missing required fields.");
             return { statusCode: 400, body: JSON.stringify({ message: "Missing required fields: id, fromUserId, toUserId, notes, adminId" }) };
@@ -66,14 +60,9 @@ exports.handler = async (event) => {
         const encryptedGSI2SK = await encryptData(`CREATED_AT`);
 
         const reviewedAt = new Date().toISOString();
-
-        // Fix: Ensure PK is not undefined before inserting
         if (!encryptedPK || !encryptedSK) {
             console.error("Error: Missing PK or SK after encryption.");
-            return {
-                statusCode: 500,
-                body: JSON.stringify({ message: "PK or SK encryption failed" }),
-            };
+            return { statusCode: 500, body: JSON.stringify({ message: "PK or SK encryption failed" }) };
         }
 
         const item = {
@@ -87,7 +76,7 @@ exports.handler = async (event) => {
             toUserId: encryptedToUserId,
             notes: encryptedNotes,
             reviewedBy: encryptedAdminId,
-            reviewedAt, // Timestamp remains unencrypted
+            reviewedAt,
         };
 
         console.log("DynamoDB Item to Insert:", JSON.stringify(item, null, 2));
@@ -97,10 +86,7 @@ exports.handler = async (event) => {
             console.log("DynamoDB Inserted Successfully");
         } catch (dbError) {
             console.error("DynamoDB Insert Failed:", JSON.stringify(dbError, null, 2));
-            return {
-                statusCode: 500,
-                body: JSON.stringify({ message: "DynamoDB Insert Failed", error: dbError.message }),
-            };
+            return { statusCode: 500, body: JSON.stringify({ message: "DynamoDB Insert Failed", error: dbError.message }) };
         }
 
         if (QUEUE_URL) {
@@ -148,7 +134,7 @@ exports.handler = async (event) => {
 
         return {
             statusCode: 200,
-            body: JSON.stringify({ message: "Message details review recorded", id: encryptedId }),
+            body: JSON.stringify({ message: "Message details recorded", id: encryptedId }),
         };
     } catch (error) {
         console.error("Unexpected Error:", JSON.stringify(error, null, 2));
