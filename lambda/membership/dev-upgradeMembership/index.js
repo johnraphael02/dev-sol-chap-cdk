@@ -64,7 +64,7 @@ exports.handler = async (event) => {
                 Item: {
                     PK: `USER#${encryptedData.userId}`,
                     SK: encryptedData.SK, // Encrypted SK
-                    membership_status: encryptedData.membershipLevel,
+                    membershipTier: encryptedData.membershipLevel,
                     created_at: timestamp,
                     updated_at: timestamp,
                     email: encryptedData.email,
