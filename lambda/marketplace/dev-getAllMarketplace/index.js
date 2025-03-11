@@ -18,7 +18,6 @@ async function decryptData(encryptedObject) {
 
     try {
         console.log("🔑 Sending to Decryption Lambda:", JSON.stringify(encryptedObject, null, 2));
-
         const response = await lambda.invoke(params).promise();
         console.log("🔑 Raw Decryption Lambda Response:", response);
 

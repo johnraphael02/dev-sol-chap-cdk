@@ -26,12 +26,17 @@ const encrypt = async (data) => {
         const response = await lambda.invoke(params).promise();
         console.log("Encryption Lambda Response:", response);
 
-        const encryptedData = JSON.parse(response.Payload);
-        if (!encryptedData.encrypted) {
+        const payload = JSON.parse(response.Payload);
+        if (payload.statusCode !== 200 || !payload.body) {
             throw new Error("Encryption Lambda returned an invalid response");
         }
 
-        return encryptedData.encrypted;
+        const body = JSON.parse(payload.body);
+        if (!body.encryptedData || !body.encryptedData.data) {
+            throw new Error("Invalid encryption format");
+        }
+
+        return body.encryptedData.data; // Extract encrypted data
     } catch (error) {
         console.error("Encryption Error:", error);
         throw new Error("Encryption failed");
