@@ -5,10 +5,10 @@ const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
 const lambda = new AWS.Lambda();
 
-// Use environment variable for encryption function name (default to "aes-encryption")
+// Environment variables
 const encryptionFunction = process.env.ENCRYPTION_FUNCTION || "sol-chap-encryption";
-const USERS_TABLE = process.env.USERS_TABLE; // DynamoDB Users Table
-const MEMBERSHIP_QUEUE_URL = process.env.MEMBERSHIP_QUEUE_URL; // SQS Queue
+const USERS_TABLE = process.env.USERS_TABLE;
+const MEMBERSHIP_QUEUE_URL = process.env.MEMBERSHIP_QUEUE_URL;
 
 exports.handler = async (event) => {
     try {
@@ -22,76 +22,80 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON format" }) };
         }
 
-        const { userId, membershipTier, email } = body;
+        const { userId, membershipLevel, email } = body;
 
-        if (!userId || !membershipTier || !email) {
-            return { statusCode: 400, body: JSON.stringify({ error: "Missing required fields (userId, membershipTier, email)" }) };
+        if (!userId || !membershipLevel || !email) {
+            return {
+                statusCode: 400,
+                body: JSON.stringify({ error: "Missing required fields (userId, membershipLevel, email)" })
+            };
         }
 
         const timestamp = new Date().toISOString();
 
-        // Invoke the encryption Lambda to encrypt userId, membershipTier, email, and SK
+        // 🔐 Invoke Encryption Lambda
         const encryptionResponse = await lambda.invoke({
             FunctionName: encryptionFunction,
             InvocationType: "RequestResponse",
             Payload: JSON.stringify({
-                data: { 
-                    userId, 
-                    membershipTier, 
-                    email, 
-                    SK: "MEMBERSHIP" // Include SK in the encryption request
+                data: {
+                    userId,
+                    membershipLevel,
+                    email,
+                    PK: `USER#${userId}`,
+                    SK: "MEMBERSHIP",
+                    GSI1PK: `EMAIL#${email}`,
+                    GSI1SK: `USER#${userId}`
                 }
-            })
+            }),
         }).promise();
 
         console.log("Encryption Lambda response:", encryptionResponse);
 
         const encryptionResult = JSON.parse(encryptionResponse.Payload);
-        console.log("Parsed encryption result:", encryptionResult);
-
         const parsedEncryptionBody = JSON.parse(encryptionResult.body);
-        const encryptedData = parsedEncryptionBody.encryptedData;
+        const encryptedData = parsedEncryptionBody.encryptedData?.data;
 
-        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipTier || !encryptedData.email || !encryptedData.SK) {
+        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipLevel || !encryptedData.email || !encryptedData.SK || !encryptedData.PK || !encryptedData.GSI1PK || !encryptedData.GSI1SK) {
             throw new Error("Encryption failed: missing encrypted data");
         }
 
-        // Store Membership Upgrade in DynamoDB
+        // ✅ Store Membership Upgrade in DynamoDB
         try {
-            console.log("Storing membership upgrade in DynamoDB...");
+            console.log("Storing membershipTier in DynamoDB...");
             await dynamoDB.put({
                 TableName: USERS_TABLE,
                 Item: {
-                    PK: `USER#${encryptedData.userId}`,
-                    SK: encryptedData.SK, // Encrypted SK
-                    membershipTier: encryptedData.membershipTier,
+                    PK: encryptedData.PK,
+                    SK: encryptedData.SK,
+                    membershipTier: encryptedData.membershipLevel, // ✅ renamed field here
                     createdAt: timestamp,
-                    updated_at: timestamp,
+                    updatedAt: timestamp,
                     email: encryptedData.email,
-                    GSI1PK: `EMAIL#${encryptedData.email}`,
-                    GSI1SK: `USER#${encryptedData.userId}`,
+                    GSI1PK: encryptedData.GSI1PK,
+                    GSI1SK: encryptedData.GSI1SK
                 },
                 ConditionExpression: "attribute_not_exists(PK)",
             }).promise();
-            console.log("Membership upgrade stored in DynamoDB");
+            console.log("MembershipTier stored in DynamoDB");
         } catch (dbError) {
             console.error("DynamoDB Error:", dbError);
             return { statusCode: 500, body: JSON.stringify({ error: "DynamoDB Write Failed" }) };
         }
 
-        // Send Membership Update to SQS Queue (if configured)
+        // ✅ Send to SQS
         if (MEMBERSHIP_QUEUE_URL) {
             try {
-                console.log("Sending membership update to SQS...");
+                console.log("Sending membershipTier update to SQS...");
                 await sqs.sendMessage({
                     QueueUrl: MEMBERSHIP_QUEUE_URL,
                     MessageBody: JSON.stringify({
                         userId: encryptedData.userId,
-                        membershipTier: encryptedData.membershipTier,
-                        timestamp
-                    })
+                        membershipTier: encryptedData.membershipLevel, // ✅ renamed field here
+                        timestamp,
+                    }),
                 }).promise();
-                console.log("Membership update sent to SQS");
+                console.log("MembershipTier update sent to SQS");
             } catch (sqsError) {
                 console.error("SQS Error:", sqsError);
                 return { statusCode: 500, body: JSON.stringify({ error: "SQS Send Failed" }) };
@@ -100,7 +104,7 @@ exports.handler = async (event) => {
             console.warn("MEMBERSHIP_QUEUE_URL not configured");
         }
 
-        // Publish EventBridge event for the membership upgrade
+        // ✅ EventBridge Notification
         try {
             console.log("Triggering EventBridge...");
             await eventBridge.putEvents({
@@ -109,8 +113,8 @@ exports.handler = async (event) => {
                     DetailType: "UpgradeMembership",
                     Detail: JSON.stringify({
                         userId: encryptedData.userId,
-                        membershipTier: encryptedData.membershipTier,
-                        timestamp
+                        membershipTier: encryptedData.membershipLevel, // ✅ renamed field here
+                        timestamp,
                     }),
                     EventBusName: "default",
                 }],
@@ -121,7 +125,7 @@ exports.handler = async (event) => {
             return { statusCode: 500, body: JSON.stringify({ error: "EventBridge Trigger Failed" }) };
         }
 
-        return { statusCode: 201, body: JSON.stringify({ message: "Membership upgraded successfully" }) };
+        return { statusCode: 201, body: JSON.stringify({ message: "MembershipTier upgraded successfully" }) };
     } catch (error) {
         console.error("Lambda Error:", error);
         return { statusCode: 500, body: JSON.stringify({ error: error.message }) };

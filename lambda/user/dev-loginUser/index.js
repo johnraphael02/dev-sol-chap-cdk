@@ -10,7 +10,7 @@ const USERS_TABLE = process.env.USERS_TABLE || "Dev-Users";
 const EMAIL_INDEX = process.env.EMAIL_INDEX || "Dev-EmailIndex";
 const ENCRYPTION_LAMBDA = process.env.ENCRYPTION_LAMBDA || "sol-chap-encryption";
 
-// 🔐 Encrypt a value via Encryption Lambda
+// 🔐 Helper: Encrypt a value via Encryption Lambda
 const encryptField = async (value) => {
   try {
     const response = await lambda.invoke({
@@ -41,88 +41,76 @@ exports.handler = async (event) => {
       };
     }
 
-    // Step 1: Encrypt the input email
+    // 🔐 Step 1: Encrypt Email
     const encryptedEmail = await encryptField(email);
-    const encryptedGSI1PK = `EMAIL#${email}`; // Still use original email for index lookup
-    const encryptedGSI1PK_Alt = `EMAIL#${encryptedEmail}`; // If GSI1PK is also encrypted
+    const encryptedGSI1PK = `EMAIL#${encryptedEmail}`;
 
-    // Step 2: Query User by encrypted email using GSI
-    const params = {
+    // 🔍 Step 2: Query user using encrypted email via GSI
+    const queryParams = {
       TableName: USERS_TABLE,
       IndexName: EMAIL_INDEX,
       KeyConditionExpression: "GSI1PK = :emailKey",
       ExpressionAttributeValues: {
-        ":emailKey": encryptedGSI1PK_Alt, // Now matching the encrypted GSI1PK
+        ":emailKey": encryptedGSI1PK,
       },
     };
 
-    const data = await docClient.query(params).promise();
+    const userQuery = await docClient.query(queryParams).promise();
 
-    if (!data.Items || data.Items.length === 0) {
+    if (!userQuery.Items || userQuery.Items.length === 0) {
       return {
         statusCode: 404,
         body: JSON.stringify({ message: "User not found." }),
       };
     }
 
-    const user = data.Items[0];
+    const user = userQuery.Items[0];
 
-    // Step 3: Validate password
-    const isValid = await bcrypt.compare(password, user.password);
-    if (!isValid) {
+    // 🔐 Step 3: Compare Password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
       return {
         statusCode: 401,
         body: JSON.stringify({ message: "Invalid credentials." }),
       };
     }
 
-    // Step 4: Generate session info
+    // 🔐 Step 4: Encrypt event = LOGIN
+    const encryptedEvent = await encryptField("LOGIN");
+
+    // 🔐 Step 5: Create session info
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
 
-    // Step 5: Query all SKs for this user (based on encrypted PK from record)
+    // 🔍 Step 6: Query all SKs for the user using encrypted PK
     const getAllSKParams = {
       TableName: USERS_TABLE,
       KeyConditionExpression: "PK = :pk",
       ExpressionAttributeValues: {
-        ":pk": user.PK, // Already encrypted PK from the record
+        ":pk": user.PK, // Already encrypted from record
       },
     };
 
     const allSKItems = await docClient.query(getAllSKParams).promise();
 
-    if (!allSKItems.Items || allSKItems.Items.length === 0) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ message: "No user session data found." }),
-      };
-    }
-
-    // Step 6: Encrypt LOGIN event
-    const encryptedEvent = await encryptField("LOGIN");
-
-    // Step 7: Update event/session fields for each SK
-    const updatePromises = allSKItems.Items.map(async (item) => {
-      const encryptedPK = item.PK; // Already encrypted
-      const encryptedSK = item.SK; // Already encrypted
-
+    // 🔐 Step 7: Update all items with session + encrypted LOGIN event
+    const updatePromises = allSKItems.Items.map((item) => {
       const updateParams = {
         TableName: USERS_TABLE,
         Key: {
-          PK: encryptedPK,
-          SK: encryptedSK,
+          PK: item.PK,
+          SK: item.SK,
         },
-        UpdateExpression: "SET #event = :event, session_id = :session, session_created_at = :timestamp",
+        UpdateExpression: "SET #event = :event, session_id = :sessionId, session_created_at = :timestamp",
         ExpressionAttributeNames: {
           "#event": "event",
         },
         ExpressionAttributeValues: {
           ":event": encryptedEvent,
-          ":session": sessionId,
+          ":sessionId": sessionId,
           ":timestamp": timestamp,
         },
       };
-
       return docClient.update(updateParams).promise();
     });
 
@@ -137,7 +125,7 @@ exports.handler = async (event) => {
       }),
     };
   } catch (err) {
-    console.error("❌ Error during login:", err);
+    console.error("❌ Login Error:", err);
     return {
       statusCode: 500,
       body: JSON.stringify({

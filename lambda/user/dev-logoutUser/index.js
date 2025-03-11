@@ -9,9 +9,9 @@ const lambda = new AWS.Lambda();
 const TABLE_NAME = process.env.USERS_TABLE_NAME || "Dev-Users";
 const QUEUE_URL = process.env.AUTH_QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "default";
-const ENCRYPTION_LAMBDA = "sol-chap-encryption";
+const ENCRYPTION_LAMBDA = process.env.ENCRYPTION_LAMBDA || "sol-chap-encryption";
 
-// 🔐 Helper to encrypt a field value
+// 🔐 Helper: Encrypt a single value via Lambda
 const encryptField = async (value) => {
   try {
     const response = await lambda.invoke({
@@ -45,14 +45,16 @@ exports.handler = async (event) => {
       };
     }
 
-    // 🔐 Encrypt only PK, SK and event field values
+    const timestamp = new Date().toISOString();
+
+    // 🔐 Encrypt PK, SK and LOGOUT event value
     const [encryptedPK, encryptedSK, encryptedEvent] = await Promise.all([
       encryptField(`USER#${userId}`),
       encryptField("SESSION"),
       encryptField("LOGOUT"),
     ]);
 
-    // ✅ Step 1: Update encrypted session record in DynamoDB
+    // ✅ Step 1: Update SESSION record in DynamoDB using encrypted PK/SK
     try {
       await dynamoDB.update({
         TableName: TABLE_NAME,
@@ -66,48 +68,47 @@ exports.handler = async (event) => {
         },
         ExpressionAttributeValues: {
           ":event": encryptedEvent,
-          ":timestamp": new Date().toISOString(),
+          ":timestamp": timestamp,
         },
       }).promise();
 
-      console.log("✅ DynamoDB session updated with encrypted PK, SK, and event.");
-    } catch (dbError) {
-      console.error("❌ DynamoDB Update Error:", dbError.message);
+      console.log("✅ DynamoDB session logout update complete.");
+    } catch (dbErr) {
+      console.error("❌ DynamoDB Update Failed:", dbErr);
       return {
         statusCode: 500,
-        body: JSON.stringify({ message: "DynamoDB update failed", error: dbError.message }),
+        body: JSON.stringify({ error: "DynamoDB update failed", details: dbErr.message }),
       };
     }
 
-    // ✅ Step 2: Send plain user info to SQS
+    // ✅ Step 2: Send logout event to SQS (plain message)
     if (QUEUE_URL) {
       try {
         await sqs.sendMessage({
           QueueUrl: QUEUE_URL,
-          MessageBody: JSON.stringify({ userId, action: "logout" }),
+          MessageBody: JSON.stringify({ userId, action: "logout", timestamp }),
         }).promise();
-        console.log("📤 SQS Message sent.");
-      } catch (sqsError) {
-        console.error("❌ SQS Error:", sqsError.message);
+        console.log("📤 Logout event sent to SQS.");
+      } catch (sqsErr) {
+        console.error("❌ SQS Error:", sqsErr.message);
       }
     }
 
-    // ✅ Step 3: Trigger EventBridge event with plain data
+    // ✅ Step 3: Trigger EventBridge Event (plain message)
     try {
       await eventBridge.putEvents({
         Entries: [
           {
             Source: "auth.service",
             DetailType: "LogoutEvent",
-            Detail: JSON.stringify({ userId, email }),
+            Detail: JSON.stringify({ userId, email, timestamp }),
             EventBusName: EVENT_BUS_NAME,
           },
         ],
       }).promise();
-
-      console.log("📡 EventBridge event sent.");
-    } catch (eventError) {
-      console.error("❌ EventBridge Error:", eventError.message);
+      console.log("📡 EventBridge logout event sent.");
+    } catch (eventBridgeErr) {
+      console.error("❌ EventBridge Error:", eventBridgeErr.message);
     }
 
     return {
@@ -117,11 +118,15 @@ exports.handler = async (event) => {
         userId,
       }),
     };
-  } catch (error) {
-    console.error("❌ Handler Error:", error.message);
+  } catch (err) {
+    console.error("❌ Logout Handler Error:", err.message);
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: "Internal Server Error" }),
+      body: JSON.stringify({
+        error: "Internal Server Error",
+        debug_message: err.message,
+        debug_stack: err.stack,
+      }),
     };
   }
 };

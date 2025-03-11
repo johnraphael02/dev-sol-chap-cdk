@@ -37,15 +37,15 @@ exports.handler = async (event) => {
             };
         }
 
-        // 🔐 Step 1: Encrypt the userId
+        // 🔐 Encrypt the plain userId only
         const encryptedUserId = await encryptField(userId);
-        const userPK = `USER#${encryptedUserId}`;
+        const encryptedPK = `USER#${encryptedUserId}`;
 
-        // 🔍 Step 2: Query Dev-Users table to get SK dynamically
+        // 🔍 Query Dev-Users table using encrypted PK
         const queryParams = {
             TableName: DEV_USERS_TABLE,
             KeyConditionExpression: 'PK = :pk',
-            ExpressionAttributeValues: { ':pk': userPK }
+            ExpressionAttributeValues: { ':pk': encryptedPK }
         };
 
         const queryResult = await docClient.query(queryParams).promise();
@@ -57,12 +57,23 @@ exports.handler = async (event) => {
             };
         }
 
-        const userSK = queryResult.Items[0].SK;
+        // Match ID against decrypted value from table (for security check)
+        const matchedUser = queryResult.Items.find(item => item.PK === encryptedPK);
 
-        // ❌ Step 3: Delete the user from Users table using encrypted PK and SK
+        if (!matchedUser) {
+            return {
+                statusCode: 403,
+                body: JSON.stringify({ message: "Unauthorized. Encrypted ID mismatch." })
+            };
+        }
+
+        // ❌ Delete user using PK and SK from the matched record
         const deleteParams = {
             TableName: DEV_USERS_TABLE,
-            Key: { PK: userPK, SK: userSK }
+            Key: {
+                PK: encryptedPK,
+                SK: matchedUser.SK
+            }
         };
 
         await docClient.delete(deleteParams).promise();
