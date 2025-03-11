@@ -22,22 +22,22 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON format" }) };
         }
 
-        const { userId, membershipLevel, email } = body;
+        const { userId, membershipTier, email } = body;
 
-        if (!userId || !membershipLevel || !email) {
-            return { statusCode: 400, body: JSON.stringify({ error: "Missing required fields (userId, membershipLevel, email)" }) };
+        if (!userId || !membershipTier || !email) {
+            return { statusCode: 400, body: JSON.stringify({ error: "Missing required fields (userId, membershipTier, email)" }) };
         }
 
         const timestamp = new Date().toISOString();
 
-        // Invoke the encryption Lambda to encrypt userId, membershipLevel, email, and SK
+        // Invoke the encryption Lambda to encrypt userId, membershipTier, email, and SK
         const encryptionResponse = await lambda.invoke({
             FunctionName: encryptionFunction,
             InvocationType: "RequestResponse",
             Payload: JSON.stringify({
                 data: { 
                     userId, 
-                    membershipLevel, 
+                    membershipTier, 
                     email, 
                     SK: "MEMBERSHIP" // Include SK in the encryption request
                 }
@@ -52,7 +52,7 @@ exports.handler = async (event) => {
         const parsedEncryptionBody = JSON.parse(encryptionResult.body);
         const encryptedData = parsedEncryptionBody.encryptedData;
 
-        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipLevel || !encryptedData.email || !encryptedData.SK) {
+        if (!encryptedData || !encryptedData.userId || !encryptedData.membershipTier || !encryptedData.email || !encryptedData.SK) {
             throw new Error("Encryption failed: missing encrypted data");
         }
 
@@ -64,7 +64,7 @@ exports.handler = async (event) => {
                 Item: {
                     PK: `USER#${encryptedData.userId}`,
                     SK: encryptedData.SK, // Encrypted SK
-                    membershipTier: encryptedData.membershipLevel,
+                    membershipTier: encryptedData.membershipTier,
                     createdAt: timestamp,
                     updated_at: timestamp,
                     email: encryptedData.email,
@@ -87,7 +87,7 @@ exports.handler = async (event) => {
                     QueueUrl: MEMBERSHIP_QUEUE_URL,
                     MessageBody: JSON.stringify({
                         userId: encryptedData.userId,
-                        membershipLevel: encryptedData.membershipLevel,
+                        membershipTier: encryptedData.membershipTier,
                         timestamp
                     })
                 }).promise();
@@ -109,7 +109,7 @@ exports.handler = async (event) => {
                     DetailType: "UpgradeMembership",
                     Detail: JSON.stringify({
                         userId: encryptedData.userId,
-                        membershipLevel: encryptedData.membershipLevel,
+                        membershipTier: encryptedData.membershipTier,
                         timestamp
                     }),
                     EventBusName: "default",

@@ -10,7 +10,7 @@ const USERS_TABLE = process.env.USERS_TABLE || "Dev-Users";
 const EMAIL_INDEX = process.env.EMAIL_INDEX || "Dev-EmailIndex";
 const ENCRYPTION_LAMBDA = process.env.ENCRYPTION_LAMBDA || "sol-chap-encryption";
 
-// 🔐 Encrypt a field via Encryption Lambda
+// 🔐 Encrypt a value via Encryption Lambda
 const encryptField = async (value) => {
   try {
     const response = await lambda.invoke({
@@ -31,27 +31,31 @@ const encryptField = async (value) => {
 };
 
 exports.handler = async (event) => {
-  const { email, password } = JSON.parse(event.body || "{}");
-
-  if (!email || !password) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ message: "Email and password are required." }),
-    };
-  }
-
-  // Step 1: Query User by Email
-  const params = {
-    TableName: USERS_TABLE,
-    IndexName: EMAIL_INDEX,
-    KeyConditionExpression: "GSI1PK = :email AND begins_with(GSI1SK, :userPrefix)",
-    ExpressionAttributeValues: {
-      ":email": `EMAIL#${email}`,
-      ":userPrefix": "USER#",
-    },
-  };
-
   try {
+    const { email, password } = JSON.parse(event.body || "{}");
+
+    if (!email || !password) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ message: "Email and password are required." }),
+      };
+    }
+
+    // Step 1: Encrypt the input email
+    const encryptedEmail = await encryptField(email);
+    const encryptedGSI1PK = `EMAIL#${email}`; // Still use original email for index lookup
+    const encryptedGSI1PK_Alt = `EMAIL#${encryptedEmail}`; // If GSI1PK is also encrypted
+
+    // Step 2: Query User by encrypted email using GSI
+    const params = {
+      TableName: USERS_TABLE,
+      IndexName: EMAIL_INDEX,
+      KeyConditionExpression: "GSI1PK = :emailKey",
+      ExpressionAttributeValues: {
+        ":emailKey": encryptedGSI1PK_Alt, // Now matching the encrypted GSI1PK
+      },
+    };
+
     const data = await docClient.query(params).promise();
 
     if (!data.Items || data.Items.length === 0) {
@@ -63,7 +67,7 @@ exports.handler = async (event) => {
 
     const user = data.Items[0];
 
-    // Step 2: Validate password
+    // Step 3: Validate password
     const isValid = await bcrypt.compare(password, user.password);
     if (!isValid) {
       return {
@@ -72,16 +76,16 @@ exports.handler = async (event) => {
       };
     }
 
-    // Step 3: Generate session info
+    // Step 4: Generate session info
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
 
-    // Step 4: Query all SKs for this user (based on unencrypted PK)
+    // Step 5: Query all SKs for this user (based on encrypted PK from record)
     const getAllSKParams = {
       TableName: USERS_TABLE,
       KeyConditionExpression: "PK = :pk",
       ExpressionAttributeValues: {
-        ":pk": user.PK, // NOTE: still plain PK from user record
+        ":pk": user.PK, // Already encrypted PK from the record
       },
     };
 
@@ -94,13 +98,13 @@ exports.handler = async (event) => {
       };
     }
 
-    // Step 5: Encrypt only the values to be stored (NOT keys)
+    // Step 6: Encrypt LOGIN event
     const encryptedEvent = await encryptField("LOGIN");
 
-    // Step 6: Update event/session fields for each SK
+    // Step 7: Update event/session fields for each SK
     const updatePromises = allSKItems.Items.map(async (item) => {
-      const encryptedPK = await encryptField(item.PK);
-      const encryptedSK = await encryptField(item.SK);
+      const encryptedPK = item.PK; // Already encrypted
+      const encryptedSK = item.SK; // Already encrypted
 
       const updateParams = {
         TableName: USERS_TABLE,
@@ -133,10 +137,14 @@ exports.handler = async (event) => {
       }),
     };
   } catch (err) {
-    console.error("❌ Error during login:", err.message);
+    console.error("❌ Error during login:", err);
     return {
       statusCode: 500,
-      body: JSON.stringify({ message: "Internal server error." }),
+      body: JSON.stringify({
+        message: "Internal server error.",
+        debug_message: err.message,
+        debug_stack: err.stack,
+      }),
     };
   }
 };
