@@ -13,12 +13,11 @@ exports.handler = async (event) => {
     // Fetch messages with status = PENDING
     const params = {
       TableName: TABLE_NAME,
-      FilterExpression: "begins_with(PK, :messagePrefix) AND #status = :pending",
+      FilterExpression: "begins_with(#status = :pending",
       ExpressionAttributeNames: {
         "#status": "status" // Use ExpressionAttributeNames for reserved words
       },
       ExpressionAttributeValues: {
-        ":messagePrefix": "MESSAGE#",
         ":pending": "PENDING"
       }
     };
