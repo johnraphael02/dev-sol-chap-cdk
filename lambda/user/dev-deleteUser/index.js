@@ -2,7 +2,6 @@ const AWS = require('aws-sdk');
 const docClient = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
 
-const USERS_TABLE = 'Users'; // Adjust accordingly
 const DEV_USERS_TABLE = 'Dev-Users'; // Adjust accordingly
 const ENCRYPTION_LAMBDA = 'sol-chap-encryption'; // Your encryption Lambda name
 
@@ -62,7 +61,7 @@ exports.handler = async (event) => {
 
         // ❌ Step 3: Delete the user from Users table using encrypted PK and SK
         const deleteParams = {
-            TableName: USERS_TABLE,
+            TableName: DEV_USERS_TABLE,
             Key: { PK: userPK, SK: userSK }
         };
 

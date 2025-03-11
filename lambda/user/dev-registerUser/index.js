@@ -7,7 +7,7 @@ const lambda = new AWS.Lambda();
 
 const USERS_TABLE = "Dev-Users";
 const SQS_QUEUE_URL = "https://sqs.ap-southeast-2.amazonaws.com/066926217034/UserQueue";
-const EMAIL_INDEX = "EmailIndex";
+const EMAIL_INDEX = "Dev-EmailIndex";
 const ENCRYPTION_LAMBDA = "sol-chap-encryption";
 
 // 🔐 Helper to encrypt any field

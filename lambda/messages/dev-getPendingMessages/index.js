@@ -6,29 +6,8 @@ const sqs = new AWS.SQS();
 const TABLE_NAME = process.env.MESSAGES_TABLE;
 const REVIEW_QUEUE_URL = process.env.REVIEW_QUEUE_URL;
 const DECRYPTION_LAMBDA = "sol-chap-decryption";
-const ENCRYPTION_LAMBDA = "sol-chap-encryption"; // Make sure this is defined in your Lambda console/env
 
-// Encrypt SK value
-const encryptValue = async (value) => {
-  try {
-    const response = await lambda.invoke({
-      FunctionName: ENCRYPTION_LAMBDA,
-      InvocationType: "RequestResponse",
-      Payload: JSON.stringify({ body: JSON.stringify({ text: value }) }),
-    }).promise();
-
-    const parsed = JSON.parse(response.Payload);
-    const encrypted = JSON.parse(parsed.body).encryptedData;
-
-    if (!encrypted) throw new Error("Missing encryptedData from encryption lambda");
-    return encrypted;
-  } catch (err) {
-    console.error("🔐 Encryption error:", err.message);
-    throw err;
-  }
-};
-
-// Decrypt the message fields
+// 🔓 Decrypt the message fields using decryption Lambda
 const decryptMessage = async (message) => {
   try {
     const response = await lambda.invoke({
@@ -72,28 +51,25 @@ const decryptMessage = async (message) => {
 
 exports.handler = async (event) => {
   try {
-    // Step 1: Encrypt the filter value for SK
-    const encryptedStatus = await encryptValue("STATUS#PENDING");
-    console.log("🔐 Encrypted SK for comparison:", encryptedStatus);
-
-    // Step 2: Scan all MESSAGE# items from DynamoDB
+    // Step 1: Scan messages with status === "PENDING"
     const scanParams = {
       TableName: TABLE_NAME,
-      FilterExpression: "begins_with(PK, :prefix)",
+      FilterExpression: "begins_with(PK, :prefix) AND #status = :pendingStatus",
+      ExpressionAttributeNames: {
+        "#status": "status" // 'status' is a reserved word in DynamoDB
+      },
       ExpressionAttributeValues: {
         ":prefix": "MESSAGE#",
+        ":pendingStatus": "PENDING"
       },
     };
 
     const scanResult = await dynamoDB.scan(scanParams).promise();
-    const allMessages = scanResult.Items || [];
-    console.log(`📦 Total messages retrieved: ${allMessages.length}`);
+    const matchedMessages = scanResult.Items || [];
 
-    // Step 3: Filter records whose SK match the encrypted SK
-    const matchedMessages = allMessages.filter(item => item.SK === encryptedStatus);
-    console.log(`✅ Matched messages with encrypted SK: ${matchedMessages.length}`);
+    console.log(`✅ Matched PENDING messages: ${matchedMessages.length}`);
 
-    // Step 4: Decrypt and push to SQS
+    // Step 2: Decrypt and push to SQS
     for (const msg of matchedMessages) {
       const decrypted = await decryptMessage(msg);
       if (!decrypted) {
@@ -116,7 +92,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       body: JSON.stringify({
-        message: "Pending messages (by encrypted SK) decrypted and pushed to SQS successfully.",
+        message: "Pending messages decrypted and pushed to SQS successfully.",
         count: matchedMessages.length,
       }),
     };
