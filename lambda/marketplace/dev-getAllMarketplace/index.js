@@ -4,14 +4,14 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 const lambda = new AWS.Lambda();
 
 const MARKETPLACE_TABLE = process.env.MARKETPLACE_TABLE;
-const DECRYPTION_LAMBDA = "sol-chap-decryption";
+const DECRYPTION_LAMBDA_NAME = process.env.DECRYPTION_LAMBDA_NAME;
 
 /**
  * Invokes the decryption Lambda function to decrypt data.
  */
 async function decryptData(encryptedObject) {
     const params = {
-        FunctionName: DECRYPTION_LAMBDA,
+        FunctionName: DECRYPTION_LAMBDA_NAME,
         InvocationType: "RequestResponse",
         Payload: JSON.stringify({ body: JSON.stringify(encryptedObject) }),
     };
