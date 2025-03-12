@@ -4,28 +4,66 @@ const AWS = require("aws-sdk");
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 const sqs = new AWS.SQS();
 const eventBridge = new AWS.EventBridge();
+const lambda = new AWS.Lambda();
 
 // Environment Variables
 const MARKETPLACE_TABLE = process.env.MARKETPLACE_TABLE;
-const MARKETPLACE_QUEUE_URL = process.env.MARKETPLACE_QUEUE_URL;
+const QUEUE_URL = process.env.QUEUE_URL;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+const ENCRYPT_LAMBDA_NAME = "sol-chap-encryption"; // Encryption Lambda function
 
 /**
- * Deletes a marketplace entry from DynamoDB
+ * Invokes the Encryption Lambda function to encrypt the marketplaceId with prefix.
+ */
+async function encryptMarketplaceId(marketplaceId) {
+    console.log(`🔑 Encrypting Marketplace ID: ${marketplaceId}`);
+
+    const prefixedId = `MARKETPLACE#${marketplaceId}`;
+    const params = {
+        FunctionName: ENCRYPT_LAMBDA_NAME,
+        InvocationType: "RequestResponse",
+        Payload: JSON.stringify({ PK: prefixedId }),
+    };
+
+    try {
+        const response = await lambda.invoke(params).promise();
+        console.log("🔒 Raw Encryption Lambda Response:", response);
+
+        const payload = JSON.parse(response.Payload);
+        console.log("🔒 Parsed Encryption Response:", payload);
+
+        if (!payload || !payload.body) {
+            throw new Error("Invalid encryption response");
+        }
+
+        const encryptedData = JSON.parse(payload.body);
+        if (!encryptedData.encryptedData || !encryptedData.encryptedData.PK) {
+            throw new Error("Encryption failed, missing PK field");
+        }
+
+        return encryptedData.encryptedData.PK;
+    } catch (error) {
+        console.error("❌ Error in encryption function:", error);
+        throw new Error("Encryption Lambda response is invalid");
+    }
+}
+
+/**
+ * Deletes a marketplace entry from DynamoDB after encrypting its ID.
  */
 exports.handler = async (event) => {
     console.log("🔍 Received Event:", JSON.stringify(event));
 
     try {
-        const encryptedMarketplaceId = event.pathParameters?.id; // Encrypted ID from URL
-        if (!encryptedMarketplaceId) {
-            return { statusCode: 400, body: JSON.stringify({ message: "Missing encrypted marketplaceId" }) };
+        const marketplaceId = event.pathParameters?.id;
+        if (!marketplaceId) {
+            return { statusCode: 400, body: JSON.stringify({ message: "Missing marketplaceId" }) };
         }
 
-        console.log(`🔑 Encrypted marketplaceId from URL: ${encryptedMarketplaceId}`);
+        console.log(`🔑 Marketplace ID from URL: ${marketplaceId}`);
 
-        // 🔍 Construct PK for query
-        const encryptedPK = `MARKETPLACE#${encryptedMarketplaceId}`;
+        // 🔐 Encrypt the marketplace ID with prefix before querying
+        const encryptedPK = await encryptMarketplaceId(marketplaceId);
 
         // 🔍 Retrieve the marketplace entry
         const queryParams = {
@@ -42,10 +80,8 @@ exports.handler = async (event) => {
             return { statusCode: 404, body: JSON.stringify({ message: "Marketplace entry not found" }) };
         }
 
-        // Extract SK from the retrieved item
         const marketplaceItem = queryResult.Items[0];
         const encryptedSK = marketplaceItem.SK;
-
         if (!encryptedSK) {
             return { statusCode: 500, body: JSON.stringify({ message: "Marketplace SK is missing" }) };
         }
@@ -60,29 +96,32 @@ exports.handler = async (event) => {
 
         console.log("🗑️ Deleting marketplace entry from DynamoDB...");
         await dynamodb.delete(deleteParams).promise();
-        console.log(`✅ Successfully deleted marketplace entry: ${encryptedMarketplaceId}`);
+        console.log(`✅ Successfully deleted marketplace entry: ${marketplaceId}`);
 
-        // 📢 Send delete event to EventBridge
+        // 📢 Publish an event to EventBridge
         const eventParams = {
             Entries: [
                 {
                     Source: "marketplace.system",
                     DetailType: "MarketplaceDeleted",
-                    Detail: JSON.stringify({ marketplaceId: encryptedMarketplaceId }),
+                    Detail: JSON.stringify({ marketplaceId }),
                     EventBusName: EVENT_BUS_NAME,
                 },
             ],
         };
-        await eventBridge.putEvents(eventParams).promise();
-        console.log(`📢 EventBridge event published: MarketplaceDeleted ${encryptedMarketplaceId}`);
 
-        // 📩 Send delete event to SQS
+        // 📩 Send a message to the SQS queue
         const sqsParams = {
-            QueueUrl: MARKETPLACE_QUEUE_URL,
-            MessageBody: JSON.stringify({ marketplaceId: encryptedMarketplaceId, action: "DELETE" }),
+            QueueUrl: QUEUE_URL,
+            MessageBody: JSON.stringify({ marketplaceId, action: "DELETE" }),
         };
-        await sqs.sendMessage(sqsParams).promise();
-        console.log(`📩 SQS message sent for deleted marketplace entry: ${encryptedMarketplaceId}`);
+
+        await Promise.all([
+            eventBridge.putEvents(eventParams).promise(),
+            sqs.sendMessage(sqsParams).promise(),
+        ]);
+
+        console.log(`📢 EventBridge event published & 📩 SQS message sent for deleted marketplace entry: ${marketplaceId}`);
 
         return { statusCode: 200, body: JSON.stringify({ message: "Marketplace entry deleted successfully" }) };
     } catch (error) {
